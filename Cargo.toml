@@ -1,0 +1,18 @@
+[package]
+name = "mca-viewer-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+egui = "0.34.2"
+eframe = {version = "0.34.2", features = ["persistence"]}
+serde = "1"
+clap = {version = "4.6", features = ["derive"]}
+image = "0.25"
+anyhow = "1"
+libdeflater = "1.25"
+fastnbt = "2.6"
+tracing = "0.1.44"
+tracing-subscriber = {version = "0.3.23", features = ["env-filter"]}
+toml = "1.1"
+crossbeam-channel = "0.5"
