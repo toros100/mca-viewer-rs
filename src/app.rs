@@ -1,11 +1,18 @@
-use std::collections::HashMap;
+use std::{borrow::Cow, cell::OnceCell, time::Duration};
 
-use crate::{Region, render_mca};
+use egui::{Rect, emath::GuiRounding};
+use tracing::info;
+
+use crate::{
+    Region, RenderMode, RenderOptions, RenderResult, TileRendererHandle, TileSpaceRectangle, View,
+    get_interner, init_tile_renderer,
+};
 
 // (adapted from https://github.com/emilk/eframe_template/ )
 // (will clean up later)
 
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
+
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)] // if we add new fields, give them default values when deserializing old state
 pub struct App {
@@ -15,52 +22,66 @@ pub struct App {
 
     boxes: bool,
 
-    #[serde(skip)]
-    texture_handle: Option<egui::TextureHandle>,
+    screen_center_region: Option<(i32, i32)>,
 
     #[serde(skip)]
-    tiles: HashMap<(i32, i32), egui::TextureHandle>,
+    render_rect: Option<egui::Rect>,
+
+    #[serde(skip)]
+    view: View,
+
+    #[serde(skip)]
+    renderer_handle: OnceCell<TileRendererHandle>,
+
+    #[serde(skip)]
+    tiles: std::collections::HashMap<(i32, i32), RenderResult>,
 
     offset: egui::Vec2,
 
     #[serde(skip)]
-    render_results_tx: crossbeam_channel::Sender<RenderResult>,
-
-    #[serde(skip)]
-    render_results_rx: crossbeam_channel::Receiver<RenderResult>,
-
-    #[serde(skip)]
-    render_tasks: Vec<Region>,
+    regions: Option<Vec<Region>>,
 
     #[serde(skip)]
     hover_pos: Option<egui::Pos2>,
 
     #[serde(skip)]
     box_texture: Option<egui::TextureHandle>,
+
+    #[serde(skip)]
+    render_opts: RenderOptions,
+
+    #[serde(skip)]
+    mode_update: bool,
+
+    #[serde(skip)]
+    curr_block: Option<Cow<'static, str>>,
 }
 
-pub struct RenderResult {
-    pub region_x: i32,
-    pub region_z: i32,
-    pub img: Option<image::RgbaImage>,
+fn tight_view(screen_center_region: (i32, i32)) -> View {
+    let (x, z) = screen_center_region;
+    let vis = TileSpaceRectangle::new(x - 5..=x + 5, z - 5..=z + 5);
+    let keep = TileSpaceRectangle::new(x - 7..=x + 7, z - 7..=z + 7);
+    View::new(vis, keep)
 }
 
 impl Default for App {
     fn default() -> Self {
-        let (render_results_tx, render_results_rx) = crossbeam_channel::bounded(100);
-
         Self {
+            screen_center_region: Some((0, 0)),
+            view: tight_view((0, 0)),
+            renderer_handle: OnceCell::new(),
+            render_rect: None,
             boxes: false,
             scale: 2.0,
             show_region_zx: false,
-            texture_handle: None,
             offset: egui::vec2(0., 0.),
-            tiles: HashMap::new(),
-            render_results_rx,
-            render_results_tx,
-            render_tasks: Vec::new(),
+            tiles: std::collections::HashMap::new(),
+            regions: Some(Vec::new()),
             hover_pos: None,
             box_texture: None,
+            render_opts: RenderOptions::default(),
+            mode_update: false,
+            curr_block: None,
         }
     }
 }
@@ -79,9 +100,42 @@ impl App {
             Default::default()
         };
 
-        a.render_tasks = regions;
+        a.regions = Some(regions);
 
         a
+    }
+    fn update_view(&mut self) -> bool {
+        if let Some(ref render_rect) = self.render_rect
+            && let Some(ref scr) = self.screen_center_region
+        {
+            // clamping above zero here because technically the width/height can be negative, that would produce
+            // nonsense values here, and i don't care to investigate when exactly it would be
+            // negative for this specicic usage
+            let world_width = render_rect.width().max(0.) / self.scale;
+            let world_height = render_rect.height().max(0.) / self.scale;
+
+            let w_fit = (0.5 * world_width / 512.0).ceil() as i32;
+            let h_fit = (0.5 * world_height / 512.0).ceil() as i32;
+
+            let (c_x, c_y) = scr;
+
+            let vis = TileSpaceRectangle::new(
+                (c_x - w_fit)..=(c_x + w_fit),
+                (c_y - h_fit)..=(c_y + h_fit),
+            );
+            let keep = vis.clone();
+
+            let new_view = View::new(vis, keep);
+
+            if !self.view.eq(&new_view) {
+                self.view = new_view;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     }
 }
 
@@ -93,9 +147,70 @@ impl eframe::App for App {
 
     /// Called each time the UI needs repainting, which may be many times per second.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let _ = self.renderer_handle.get_or_init(|| {
+            init_tile_renderer(
+                ui.ctx().clone(),
+                std::thread::available_parallelism().unwrap().get(),
+            )
+        });
+
         // Put your widgets into a `SidePanel`, `TopBottomPanel`, `CentralPanel`, `Window` or `Area`.
         // For inspiration and more examples, go to https://emilk.github.io/egui
         //
+
+        if ui.input_mut(|r| r.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+            match self.render_opts.mode {
+                RenderMode::Normal => self.render_opts.mode = RenderMode::Slice(100),
+                RenderMode::Slice(_) => self.render_opts.mode = RenderMode::Normal,
+            }
+            self.mode_update = true;
+        };
+
+        if ui.input_mut(|r| r.consume_key(egui::Modifiers::NONE, egui::Key::F2)) {
+            self.render_opts.depth_darken = !self.render_opts.depth_darken;
+            self.mode_update = true;
+        };
+
+        if ui.input_mut(|r| r.consume_key(egui::Modifiers::NONE, egui::Key::F3)) {
+            self.render_opts.with_block_map = !self.render_opts.with_block_map;
+            self.mode_update = true;
+        };
+
+        if ui.input_mut(|r| r.consume_key(egui::Modifiers::NONE, egui::Key::F4)) {
+            let mut timings: Vec<std::time::Duration> =
+                self.tiles.values().map(|r| r.dur).collect();
+            timings.sort();
+            let median_idx = timings.len() / 2;
+            if !timings.is_empty() {
+                let median_dur = timings[median_idx];
+                info!("median of {} durations: {:.3?}", timings.len(), median_dur);
+            }
+
+            let total = timings.iter().fold(Duration::ZERO, |acc, x| acc + *x);
+            info!("total: {:.3?}", total);
+        }
+
+        // if ui.input_mut(|r| r.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
+        //     let int = get_interner();
+        //     let r = int.dyn_interner.read().unwrap();
+        //     println!("STATIC LOOKUP");
+        //     for (&bs, idx) in int.static_interner.bs_to_idx.iter() {
+        //         println!(
+        //             "[{}]: {}",
+        //             u16::from(BlockId::from(*idx)),
+        //             String::from_utf8_lossy(bs)
+        //         )
+        //     }
+        //     println!("----------------");
+        //     println!("DYN LOOKUP");
+        //     for (&bs, idx) in r.bs_to_idx.iter() {
+        //         println!(
+        //             "[{}]: {}",
+        //             u16::from(BlockId::from(*idx)),
+        //             String::from_utf8_lossy(bs)
+        //         )
+        //     }
+        // };
 
         if self.box_texture.is_none() {
             let mut img = image::RgbaImage::new(512, 512);
@@ -142,14 +257,12 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            while let Ok(r) = self.render_results_rx.try_recv() {
-                if let Some(img) = r.img {
-                    let handle = ui.ctx().load_texture(
-                        format!("r.{}.{}.mca", r.region_x, r.region_z),
-                        egui::ColorImage::from_rgba_premultiplied([512, 512], img.as_raw()),
-                        egui::TextureOptions::NEAREST,
-                    );
-                    self.tiles.insert((r.region_x, r.region_z), handle);
+            let renderer = self.renderer_handle.get().unwrap();
+
+            while let Some(res) = renderer.try_recv() {
+                if self.view.keep(res.region_x, res.region_z) {
+                    self.tiles.insert((res.region_x, res.region_z), res);
+                    ui.ctx().request_repaint();
                 }
             }
 
@@ -157,33 +270,55 @@ impl eframe::App for App {
 
             ui.separator();
 
+            if let Some(rs) = self.regions.take() {
+                _ = renderer.render_regions(rs)
+            }
+
             ui.horizontal(|ui| {
-                if ui.button("test render").clicked() {
-                    while let Some(t) = self.render_tasks.pop() {
-                        let res_tx = self.render_results_tx.clone();
-                        std::thread::spawn(move || -> anyhow::Result<()> {
-                            let f = std::fs::File::open(t.path)?;
-
-                            let img = render_mca(f)?;
-
-                            let res = RenderResult {
-                                region_x: t.x,
-                                region_z: t.z,
-                                img: Some(img),
-                            };
-
-                            res_tx.try_send(res)?;
-
-                            Ok(())
-                        });
-                    }
-                }
-
                 ui.label(if let Some(p) = self.hover_pos {
                     format!("cursor block: {:.0}/{:.0}", p.x, p.y)
                 } else {
                     "cursor xz: ---".into()
                 });
+
+                let cursor_reg_loc = self.hover_pos.map(|p| {
+                    (
+                        // WARN: need to round properly here lol
+                        // need to correct for pixel size and round towards center of pixel
+                        (p.x - 512. * (p.x).div_euclid(512.0)).floor() as i32,
+                        (p.y - 512. * (p.y).div_euclid(512.0)).floor() as i32,
+                    )
+                });
+
+                let cursor_reg = self.hover_pos.map(|p| {
+                    (
+                        p.x.div_euclid(512.0).floor() as i32,
+                        p.y.div_euclid(512.0).floor() as i32,
+                    )
+                });
+
+                let p = if let Some((x, y)) = cursor_reg_loc
+                    && let Some(rp) = cursor_reg
+                    && let Some(r) = self.tiles.get(&rp)
+                    && let Some(ref lookup) = r.lookup
+                {
+                    let ux = x.clamp(0, 511) as usize;
+                    let uy = y.clamp(0, 511) as usize;
+                    let idx = ux + 512 * uy;
+
+                    let id = lookup.get(ux, uy);
+                    let name_bytes = get_interner().get_bytes(id);
+                    Some((name_bytes, idx))
+                } else {
+                    None
+                };
+
+                let b = match p {
+                    Some((c, _)) => c.map(String::from_utf8_lossy),
+                    None => None,
+                };
+
+                self.curr_block = b;
 
                 ui.label(if let Some(p) = self.hover_pos {
                     format!(
@@ -195,7 +330,18 @@ impl eframe::App for App {
                     "cursor region: ---".into()
                 });
 
-                ui.label(format!("scale: {:.2}", self.scale));
+                ui.label(if let Some(p) = cursor_reg_loc {
+                    format!("region local: {}/{}", p.0, p.1)
+                } else {
+                    "region local: ---".into()
+                });
+
+                ui.label(format!("scale: {:.3}", self.scale));
+
+                ui.label(format!(
+                    "screen center region: {:?}",
+                    self.screen_center_region
+                ));
 
                 if ui.button("toggle region pos").clicked() {
                     self.show_region_zx = !self.show_region_zx
@@ -206,33 +352,75 @@ impl eframe::App for App {
                 }
             });
 
-            let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
+            let (render_rect, response) =
+                ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
+            self.render_rect = Some(render_rect);
+            let painter = ui.painter_at(render_rect);
             self.offset += response.drag_delta();
+
+            // TODO: mapping of cursor pos into world space is slightly bogged
+            // have to think about it and do it properly
 
             self.hover_pos = ui.input(|i| {
                 i.pointer
                     .hover_pos()
                     .map(|p| (p - self.offset) / self.scale)
+                    .map(|p| p.round_to_pixel_center(ui.pixels_per_point() * self.scale))
             });
 
-            if raw_scroll_delta.y != 0.0 {
-                let screen_center_x = rect.width() / 2.0 + rect.min.x;
-                let screen_center_y = rect.height() / 2.0 + rect.min.y;
+            self.screen_center_region = Some({
+                let screen_center_x = render_rect.width() / 2.0 + render_rect.min.x;
+                let screen_center_y = render_rect.height() / 2.0 + render_rect.min.y;
 
                 let world_center_x = (screen_center_x - self.offset.x) / self.scale;
                 let world_center_y = (screen_center_y - self.offset.y) / self.scale;
-                if raw_scroll_delta.y > 0.0 {
-                    self.scale = (self.scale + 0.5).clamp(0.5, 4.0)
-                } else if raw_scroll_delta.y < 0.0 {
-                    self.scale = (self.scale - 0.5).clamp(0.5, 4.0)
+
+                (
+                    ((world_center_x.signum() * world_center_x.abs().ceil()) as i32)
+                        .div_euclid(512),
+                    ((world_center_y.signum() * world_center_y.abs().ceil()) as i32)
+                        .div_euclid(512),
+                )
+            });
+
+            if raw_scroll_delta.y != 0.0 {
+                if ui.input(|r| r.modifiers.command) {
+                    if let RenderMode::Slice(ref mut h) = self.render_opts.mode {
+                        if raw_scroll_delta.y < 0.0 {
+                            *h = h.saturating_add(1)
+                        } else {
+                            *h = h.saturating_sub(1)
+                        }
+                        self.mode_update = true;
+                    }
+                } else {
+                    // WARN: this should NOT change which world position is at the "screen" center
+                    let screen_center_x = render_rect.width() / 2.0 + render_rect.min.x;
+                    let screen_center_y = render_rect.height() / 2.0 + render_rect.min.y;
+
+                    let world_center_x = (screen_center_x - self.offset.x) / self.scale;
+                    let world_center_y = (screen_center_y - self.offset.y) / self.scale;
+                    let scale_fac = if raw_scroll_delta.y > 0.0 { 2. } else { 0.5 };
+
+                    self.scale = (self.scale * scale_fac).clamp(0.0625, 8.0);
+
+                    let o_x = screen_center_x - world_center_x * self.scale;
+                    let o_y = screen_center_y - world_center_y * self.scale;
+
+                    self.offset = egui::vec2(o_x, o_y);
                 }
-
-                let o_x = screen_center_x - world_center_x * self.scale;
-                let o_y = screen_center_y - world_center_y * self.scale;
-
-                self.offset = egui::vec2(o_x, o_y);
             }
-            let painter = ui.painter_at(rect);
+
+            if self.update_view() {
+                // HACK: i do not like this
+                self.tiles.retain(|p, _| self.view.keep(p.0, p.1));
+                _ = self
+                    .renderer_handle
+                    .get()
+                    .unwrap()
+                    .update_view(self.view.clone());
+            }
+
             for ((x, y), handle) in self.tiles.iter() {
                 let pos = egui::pos2(*x as f32 * 512. * self.scale, *y as f32 * 512. * self.scale)
                     + self.offset.round();
@@ -243,7 +431,7 @@ impl eframe::App for App {
                 );
 
                 let t_uv = egui::Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(1., 1.));
-                painter.image(handle.id(), t_rect, t_uv, egui::Color32::WHITE);
+                painter.image(handle.tex_handle.id(), t_rect, t_uv, egui::Color32::WHITE);
 
                 if self.boxes
                     && let Some(ref t) = self.box_texture
@@ -261,7 +449,37 @@ impl eframe::App for App {
                     );
                 }
             }
+
+            if let Some(ref a) = self.curr_block {
+                let layout = painter.layout_no_wrap(
+                    a.to_string(),
+                    egui::FontId::proportional(24.0),
+                    egui::Color32::WHITE,
+                );
+
+                let pos = egui::pos2(10., 70.);
+                let rect = Rect::from_min_size(pos, layout.size()).expand(12.0);
+                painter.rect_filled(rect, 0., egui::Color32::from_black_alpha(180u8));
+                painter.galley(pos, layout, egui::Color32::WHITE);
+
+                // _ = painter.text(
+                //     egui::pos2(20., 60.),
+                //     egui::Align2::LEFT_TOP,
+                //     a,
+                //     egui::FontId::proportional(24.0),
+                //     egui::Color32::B,
+                // )
+            };
         });
+
+        if self.mode_update {
+            _ = self
+                .renderer_handle
+                .get()
+                .unwrap()
+                .update_render_options(self.render_opts.clone());
+            self.mode_update = false;
+        }
     }
 }
 

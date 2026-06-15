@@ -1,7 +1,7 @@
-use std::path::PathBuf;
+use std::{hint::black_box, path::PathBuf};
 
 use clap::Parser;
-use mca_viewer_rs::get_palette;
+use mca_viewer_rs::{get_palette, unpack_from_u64_bytes_width_4};
 
 #[derive(clap::Parser)]
 struct Args {
@@ -11,11 +11,15 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
+    black_box(unpack_from_u64_bytes_width_4(
+        black_box(&[0u8; 8]),
+        black_box(0),
+    ));
     _ = get_palette(); // to init the OnceLock
 
     let args = Args::parse();
 
-    let regions = mca_viewer_rs::parse_regions_in_dir(&args.path, Some(-4..4), Some(-4..4))?;
+    let regions = mca_viewer_rs::parse_regions_in_dir(&args.path)?;
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(

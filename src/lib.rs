@@ -1,26 +1,28 @@
 mod app;
 mod bitpack;
-mod chunk;
+mod block_id;
+mod block_map;
+pub mod chunk;
+mod colors;
 mod loader;
 mod palette;
 mod render;
+mod tile_renderer;
 
-use std::{
-    ops::RangeBounds,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 pub use app::App;
 pub use bitpack::*;
-pub use chunk::*;
 pub use loader::*;
 pub use palette::*;
 pub use render::*;
+pub use tile_renderer::*;
 
+#[derive(Clone)]
 pub struct Region {
-    x: i32,
-    z: i32,
-    path: PathBuf,
+    pub x: i32,
+    pub z: i32,
+    pub path: PathBuf,
 }
 
 impl Region {
@@ -30,13 +32,12 @@ impl Region {
 }
 
 fn validate_mca_file(pb: PathBuf) -> anyhow::Result<Region> {
-    if !pb.is_file() {
-        anyhow::bail!("not a file")
-    };
+    // NOTE: i realized it's very costly to check pb.is_file() here
+    // if it's not, that will be caught later
 
     let s = pb
         .file_name()
-        .unwrap() // unwrap safe because pb.is_file()
+        .ok_or_else(|| anyhow::anyhow!("no file name"))?
         .to_str()
         .ok_or(anyhow::anyhow!("name is not valid unicode"))?;
 
@@ -55,18 +56,30 @@ fn parse_mca_file_name(s: &str) -> anyhow::Result<(i32, i32)> {
     Ok((region_x, region_z))
 }
 
-pub fn parse_regions_in_dir(
-    path: &Path,
-    x_range: Option<impl RangeBounds<i32>>,
-    z_range: Option<impl RangeBounds<i32>>,
-) -> anyhow::Result<Vec<Region>> {
+pub fn parse_regions_in_dir(path: &Path) -> anyhow::Result<Vec<Region>> {
     Ok(std::fs::read_dir(path)?
         .filter_map(|entry| validate_mca_file(entry.ok()?.path()).ok())
-        .filter(|region: &Region| {
-            x_range.as_ref().is_none_or(|x_rg| x_rg.contains(&region.x))
-                && z_range.as_ref().is_none_or(|z_rg| z_rg.contains(&region.z))
-        })
         .collect())
+}
+
+/// regular `unreachable!()` if  the cautious_unsafe feature is enabled, otherwise `unreachable_unchecked()`
+#[macro_export]
+macro_rules! cfg_unreachable {
+    () => {
+        if cfg!(feature = "cautious_unsafe") {
+            ::std::unreachable!()
+        } else {
+            unsafe { ::std::hint::unreachable_unchecked() }
+        }
+    };
+}
+
+#[macro_export]
+/// shorthand for cfg!(feature = "cautious_unsafe")
+macro_rules! cautious_unsafe {
+    () => {
+        cfg!(feature = "cautious_unsafe")
+    };
 }
 
 #[cfg(test)]
