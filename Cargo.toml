@@ -1,40 +1,6 @@
-[package]
-name = "mca-viewer-rs"
-version = "0.1.0"
-edition = "2024"
-default-run = "mca-viewer-rs"
-
-[features]
-cautious_unsafe = []
-
-[[bin]]
-name = "sim"
-
-[dependencies]
-egui = "0.34.3"
-eframe = {version = "0.34.3", features = ["persistence"]}
-serde = "1"
-clap = {version = "4.6", features = ["derive"]}
-image = "0.25"
-anyhow = "1"
-libdeflater = "1.25"
-tracing = "0.1.44"
-tracing-subscriber = {version = "0.3.23", features = ["env-filter"]}
-toml = "1.1"
-crossbeam-channel = "0.5"
-nbt = {path = "../nbt-rs/nbt"}
-rustc-hash = "2.1.2"
-hashbrown = "0.17.1"
-rand = "0.10.1"
-bytemuck = "1.25"
-
-[dev-dependencies]
-criterion = "0.8.2"
-
-
-[[bench]]
-name = "match"
-harness = false
+[workspace]
+members = ["mca-viewer-rs", "nbt", "nbt-derive"]
+resolver = "3"
 
 [profile.best]
 inherits = "release"
