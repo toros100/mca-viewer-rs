@@ -1,22 +1,16 @@
 use nbt::{
-    ConstBytes, DeserializationError, DeserializePayload, DeserializeReuse, List,
-    arrays::LongArrayBytes, read_i32_len,
+    ConstBytes, DeserializationError, DeserializePayload, arrays::LongArrayBytes, read_i32_len,
 };
 
 use crate::{bits_required, cautious_unsafe, unpack_from_u64_bytes_dispatch};
 
 const MINECRAFT_AIR: &[u8] = b"minecraft:air";
 
-#[cfg(not(feature = "cautious_unsafe"))]
-unsafe impl<'d> DeserializeReuse for Chunk<'d> {
-    type Borrow<'b> = Chunk<'b>;
-}
-
 #[derive(DeserializePayload)]
 pub struct Chunk<'a> {
     #[nbt(rename = "Status")]
     pub status: StatusMinecraftFull,
-    pub sections: List<Section<'a>>,
+    pub sections: Vec<Section<'a>>,
     #[nbt(rename = "Heightmaps")]
     pub heightmaps: Heightmaps,
 
@@ -28,18 +22,26 @@ pub struct Chunk<'a> {
 }
 
 impl<'a> Chunk<'a> {
-    pub fn block_at(&'a self, x: u16, y: u16, z: u16) -> &'a [u8] {
-        debug_assert!(x < 16);
-        debug_assert!(z < 16);
-        debug_assert!(y < self.y_limit);
+    /// consumes a Chunk<'a> (typically with borrowed data), clears any references with lifetime 'a
+    /// and returns Chunk<'static> using unsafe
+    pub fn reclaim(mut self) -> Chunk<'static> {
+        self.sanitize();
+        // # Safety
+        // sanitize gets rid of any 'a-lifetimed references in self (currently only in Vec and
+        // Option, which are cleared resp. set to None).
+        //
+        // i believe this is actually sound, what could possibly go wrong?
+        //
+        unsafe { std::mem::transmute::<Chunk<'a>, Chunk<'static>>(self) }
+    }
 
-        match self.section_for_y(y) {
-            Some(s) => {
-                let block_idx = (y % 16) * 256 + 16 * z + x;
-                // NOTE: observe that block_idx < 4095 by the above asserts
-                s.block_states.get_block(block_idx)
-            }
-            None => MINECRAFT_AIR,
+    pub fn sanitize(&mut self) {
+        // NOTE: deliberately NOT clearing self.sections, so we can keep the delicious heap
+        // allocations inside the invidual sections
+        self.sections_lookup.clear();
+        self.y_limit = 0;
+        for s in self.sections.iter_mut() {
+            s.block_states.sanitize();
         }
     }
 
@@ -79,6 +81,21 @@ impl<'a> Chunk<'a> {
         Ok(())
     }
 
+    pub fn block_at(&'a self, x: u16, y: u16, z: u16) -> &'a [u8] {
+        debug_assert!(x < 16);
+        debug_assert!(z < 16);
+        debug_assert!(y < self.y_limit);
+
+        match self.section_for_y(y) {
+            Some(s) => {
+                let block_idx = (y % 16) * 256 + 16 * z + x;
+                // NOTE: observe that block_idx < 4095 by the above asserts
+                s.block_states.get_block(block_idx)
+            }
+            None => MINECRAFT_AIR,
+        }
+    }
+
     fn section_for_y(&self, y: u16) -> Option<&Section<'a>> {
         let idx = (y as usize) / 16;
         self.sections_lookup[idx].map(|i| &self.sections[i])
@@ -89,7 +106,7 @@ impl Default for Chunk<'_> {
     fn default() -> Self {
         Self {
             status: StatusMinecraftFull,
-            sections: List::with_capacity(24),
+            sections: Vec::with_capacity(24),
             sections_lookup: Vec::with_capacity(24),
             heightmaps: Heightmaps::default(),
             y_limit: 0u16,
@@ -215,7 +232,7 @@ impl<'a> BlockStates<'a> {
 
 #[derive(DeserializePayload)]
 pub struct BlockStates<'a> {
-    pub palette: List<Block<'a>>,
+    pub palette: Vec<Block<'a>>,
 
     #[nbt(optional)]
     data: Option<LongArrayBytes<'a>>,
@@ -224,10 +241,18 @@ pub struct BlockStates<'a> {
     bit_width: usize,
 }
 
+impl BlockStates<'_> {
+    fn sanitize(&mut self) {
+        self.palette.clear();
+        self.data = None;
+        self.bit_width = 0;
+    }
+}
+
 impl Default for BlockStates<'_> {
     fn default() -> Self {
         Self {
-            palette: List::with_capacity(7),
+            palette: Vec::with_capacity(7),
             data: None,
             bit_width: 0,
         }

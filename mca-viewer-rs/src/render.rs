@@ -1,9 +1,4 @@
-#[cfg(feature = "cautious_unsafe")]
-use nbt::from_bytes;
-
-#[cfg(not(feature = "cautious_unsafe"))]
-use nbt::Reusable;
-
+use nbt::DeserializeExt;
 use std::ops::{Deref, DerefMut};
 
 use crate::{
@@ -110,11 +105,13 @@ pub fn render_region(
     let mut any_chunk_ok = false;
 
     #[cfg(not(feature = "cautious_unsafe"))]
-    let mut reusable_chunk = Reusable::<Chunk>::default();
+    let mut chunk = Chunk::default();
 
     for chunk_z in 0..32 {
         for chunk_x in (0..32).rev() {
             let chunk_idx = 32 * chunk_z + chunk_x;
+
+            chunk = chunk.reclaim();
 
             let cd = match loader.get_chunk_data(chunk_idx) {
                 Err(_) => {
@@ -125,13 +122,14 @@ pub fn render_region(
             };
 
             #[cfg(not(feature = "cautious_unsafe"))]
-            let mut chunk = match reusable_chunk.try_deserialize_into(cd) {
-                Err(_) => {
+            {
+                let (c, res) = chunk.try_deserialize_into(cd);
+                chunk = c;
+                if res.is_err() {
                     height_cache.invalidate(chunk_x);
                     continue;
                 }
-                Ok((_, c, _)) => c,
-            };
+            }
 
             #[cfg(feature = "cautious_unsafe")]
             let mut chunk = match nbt::from_bytes::<Chunk>(cd) {
@@ -286,7 +284,7 @@ pub fn render_slice(
     }
 
     #[cfg(not(feature = "cautious_unsafe"))]
-    let mut reusable_chunk = Reusable::<Chunk>::default();
+    let mut chunk = Chunk::default();
 
     let mut height_cache = HeightCache::default();
     let mut any_chunk_ok = false;
@@ -294,6 +292,7 @@ pub fn render_slice(
         for chunk_x in (0..32).rev() {
             let chunk_idx = 32 * chunk_z + chunk_x;
 
+            chunk = chunk.reclaim();
             let cd = match loader.get_chunk_data(chunk_idx) {
                 Err(_) => {
                     height_cache.invalidate(chunk_x);
@@ -303,13 +302,14 @@ pub fn render_slice(
             };
 
             #[cfg(not(feature = "cautious_unsafe"))]
-            let mut chunk = match reusable_chunk.try_deserialize_into(cd) {
-                Err(_) => {
+            {
+                let (c, res) = chunk.try_deserialize_into(cd);
+                chunk = c;
+                if res.is_err() {
                     height_cache.invalidate(chunk_x);
                     continue;
                 }
-                Ok((_, c, _)) => c,
-            };
+            }
 
             #[cfg(feature = "cautious_unsafe")]
             let mut chunk = match nbt::from_bytes::<Chunk>(cd) {
