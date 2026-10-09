@@ -8,7 +8,7 @@ pub mod region;
 pub mod renderer;
 pub mod worker;
 
-static_assertions::assert_type_eq_all!(slint::wgpu_29::wgpu::Device, vello::wgpu::Device);
+static_assertions::assert_type_eq_all!(slint::wgpu_30::wgpu::Device, vello::wgpu::Device);
 
 #[macro_export]
 macro_rules! cfg_unreachable {

@@ -1,4 +1,4 @@
-use slint::wgpu_29::wgpu;
+use slint::wgpu_30::wgpu;
 use vello::kurbo::Rect;
 mod wgpu_render;
 pub use wgpu_render::{GpuTile, RenderCtx};

@@ -1,4 +1,4 @@
-use slint::wgpu_29::wgpu;
+use slint::wgpu_30::wgpu;
 use vello::kurbo::Rect;
 
 const TILES_MODULE_DESCR: wgpu::ShaderModuleDescriptor = wgpu::include_wgsl!("tiles.wgsl");
@@ -138,11 +138,11 @@ impl WgpuRenderer {
                 module: &module,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<Instance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &INSTANCE_ATTRS,
-                }],
+                })],
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleStrip,

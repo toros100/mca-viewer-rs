@@ -6,7 +6,7 @@ use mca_viewer_rs::palette::{BlockPalette, PaletteCtx};
 use slint::ModelExt;
 use slint::language::{KeyboardModifiers, PointerEventKind};
 use slint::platform::PointerEventButton;
-use slint::wgpu_29::wgpu;
+use slint::wgpu_30::wgpu;
 use std::cell::RefMut;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -682,8 +682,8 @@ impl<P: PaletteCtx + Send + Sync + 'static> App<P> {
             let window = window.as_weak();
             move |state, graphics_api| match state {
                 slint::RenderingState::RenderingSetup => {
-                    let slint::GraphicsAPI::WGPU29 { device, queue, .. } = graphics_api else {
-                        panic!("unexpected graphics API (expected wgpu29)");
+                    let slint::GraphicsAPI::WGPU30 { device, queue, .. } = graphics_api else {
+                        panic!("unexpected graphics API (expected wgpu30)");
                     };
 
                     app.borrow_mut()
