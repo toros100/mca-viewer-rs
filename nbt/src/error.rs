@@ -3,7 +3,10 @@ use std::borrow::Cow;
 use thiserror::Error;
 
 pub type DeserializationResult<T> = std::result::Result<T, DeserializationError>;
-pub type SerializationResult<T> = std::result::Result<T, DeserializationError>;
+
+// NOTE: only using this with T = () for now
+// might adapt serialization to also return the number of bytes written
+pub type SerializationResult<T> = std::result::Result<T, SerializationError>;
 
 #[derive(Error, Debug)]
 pub enum DeserializationError {
@@ -27,10 +30,10 @@ pub enum DeserializationError {
 
 #[derive(Error, Debug)]
 pub enum SerializationError {
-    #[error("string too long (> u16::MAX bytes)")]
+    #[error("string too long (len > u16::MAX)")]
     StringTooLong,
-    #[error("list or array too long (> i32::MAX bytes)")]
+    #[error("list or array too long (len > i32::MAX)")]
     SeqTooLong,
-    #[error("serialization error:")]
+    #[error("serialization error: {}", .0)]
     Custom(Cow<'static, str>),
 }

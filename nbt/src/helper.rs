@@ -1,8 +1,13 @@
-use crate::{DeserializationError, DeserializationResult, SerializationError, Tag};
+use std::borrow::Cow;
 
-// named as such because lengths are encoded in nbt as big endian 32 bit signed integers
+use crate::{
+    DeserializationError, DeserializationResult, SerializationError, SerializationResult, Tag,
+};
+
+// named as such because (list and array) lengths are encoded in nbt as big endian 32 bit signed integers
 // the len arg is still usize for convenience
-pub fn write_i32_len(len: usize, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+#[inline]
+pub fn write_be_i32_len(len: usize, buf: &mut Vec<u8>) -> SerializationResult<()> {
     if len > i32::MAX as usize {
         Err(SerializationError::SeqTooLong)
     } else {
@@ -12,7 +17,8 @@ pub fn write_i32_len(len: usize, buf: &mut Vec<u8>) -> Result<(), SerializationE
     }
 }
 
-pub fn serialize_nbt_str(s: &str, buf: &mut Vec<u8>) -> Result<(), SerializationError> {
+#[inline]
+pub fn serialize_nbt_str(s: &str, buf: &mut Vec<u8>) -> SerializationResult<()> {
     if s.len() > u16::MAX as usize {
         return Err(SerializationError::StringTooLong);
     }
@@ -22,6 +28,18 @@ pub fn serialize_nbt_str(s: &str, buf: &mut Vec<u8>) -> Result<(), Serialization
 }
 
 /// unchecked w.r.t. utf8
+#[inline]
+pub fn serialize_nbt_str_bytes(data: &[u8], buf: &mut Vec<u8>) -> SerializationResult<()> {
+    if data.len() > u16::MAX as usize {
+        return Err(SerializationError::StringTooLong);
+    }
+    buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    buf.extend_from_slice(data);
+    Ok(())
+}
+
+/// unchecked w.r.t. utf8
+#[inline]
 pub fn deserialize_nbt_str_bytes(data: &[u8]) -> DeserializationResult<(&[u8], usize)> {
     if data.len() < 2 {
         return Err(DeserializationError::EOF);
@@ -36,6 +54,7 @@ pub fn deserialize_nbt_str_bytes(data: &[u8]) -> DeserializationResult<(&[u8], u
     Ok((d, 2 + l))
 }
 
+#[inline]
 pub fn deserialize_nbt_str(data: &[u8]) -> DeserializationResult<(&str, usize)> {
     if data.len() < 2 {
         return Err(DeserializationError::EOF);
@@ -50,6 +69,7 @@ pub fn deserialize_nbt_str(data: &[u8]) -> DeserializationResult<(&str, usize)> 
     Ok((s, 2 + l))
 }
 
+#[inline]
 fn skip_fixed_size_seq(data: &[u8], byte_size: usize) -> DeserializationResult<usize> {
     if data.len() < 4 {
         Err(DeserializationError::EOF)
@@ -66,6 +86,8 @@ fn skip_fixed_size_seq(data: &[u8], byte_size: usize) -> DeserializationResult<u
 }
 
 /// NOTE: don't forget to advance the offset by 4 after using this
+/// (the returned value is the deserialized length as usize, yes this is a bit ugly)
+#[inline]
 pub fn read_i32_len(data: &[u8]) -> DeserializationResult<usize> {
     if data.len() < 4 {
         return Err(DeserializationError::EOF);
@@ -147,6 +169,7 @@ pub fn skip_payload(data: &[u8], tag: Tag) -> DeserializationResult<usize> {
     }
 }
 
+#[inline]
 fn skip_k(data: &[u8], k: usize) -> DeserializationResult<usize> {
     if data.len() < k {
         Err(DeserializationError::EOF)
@@ -155,6 +178,7 @@ fn skip_k(data: &[u8], k: usize) -> DeserializationResult<usize> {
     }
 }
 
+#[inline]
 fn skip_nbt_str(data: &[u8]) -> DeserializationResult<usize> {
     if data.len() < 2 {
         return Err(DeserializationError::EOF);

@@ -1,0 +1,304 @@
+import { Button, ComboBox, ScrollView, ListView } from "std-widgets.slint";
+import {
+    PopupMenu,
+    PopupMenuButton,
+    PopupMenuHeading,
+} from "popup_menu.slint";
+
+export struct PaletteEntry {
+    id: int,
+    name: string,
+    color: color,
+}
+
+component PaletteRow inherits HorizontalLayout {
+    in property <PaletteEntry> entry;
+    padding-top: 8px;
+    padding-left: 8px;
+
+    spacing: 8px;
+    cross-axis-alignment: center;
+    Rectangle {
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: black;
+        width: 22px;
+        height: 22px;
+        background: entry.color;
+    }
+
+    Text {
+        text: entry.name;
+    }
+}
+
+export struct WorldPosition {
+    block_x: int,
+    block_z: int,
+    region_x: int,
+    region_z: int,
+    block_x_in_region: int,
+    block_z_in_region: int,
+}
+
+export global Notify {
+    callback notify();
+}
+
+export enum RenderMode {
+    Normal,
+    Slice,
+}
+
+export struct RenderOptions {
+    mode: RenderMode,
+    height: int,
+    depth_darken: bool,
+    block_map: bool,
+}
+
+component HRule {
+    in property <color> color: #5c5c5c;
+    in property <length> line_width: 1px;
+    in property <length> pad_top_bottom: 4px;
+    height: line_width + 2 * pad_top_bottom;
+    width: 100%;
+
+    HorizontalLayout {
+        alignment: center;
+        padding-top: root.pad_top_bottom;
+        padding-bottom: root.pad_top_bottom;
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            background: root.color;
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+
+    in property <WorldPosition> world_position;
+    in property <string> block_at_cursor;
+    in-out property <RenderOptions> render_options;
+
+    in property <[PaletteEntry]> palette;
+
+    pure function fmt_world_position(w: WorldPosition) -> string {
+        "block: (\{w.block-x}, \{w.block-z}) - region: (\{w.region-x}, \{w.region-z}) - block in region: (\{w.block-x-in-region}, \{w.block-z-in-region})"
+    }
+
+    pure function sign(f: float) -> int {
+        if (f < 0) {
+            -1
+        } else if (f > 0) {
+            1
+        } else {
+            0
+        }
+    }
+
+    preferred-width: 1200px;
+    preferred-height: 1200px;
+
+    callback toggle_grid();
+
+    callback pointer_event(kind: PointerEventKind, button: PointerEventButton, modifiers: KeyboardModifiers, x: float, y: float);
+    callback canvas_size_changed(float, float);
+
+    callback increase_scale(mouse_x: length, mouse_y: length, is_mouse: bool);
+    callback decrease_scale(mouse_x: length, mouse_y: length, is_mouse: bool);
+
+    callback change_slice_height(int);
+
+    callback reset_scale();
+
+    callback set_render_options(RenderOptions);
+
+    callback render();
+
+    callback fix_palette();
+
+    in-out property <length> rcm_x;
+    in-out property <length> rcm_y;
+
+    function show_rcm(block: string, mouse_x: length, mouse_y: length) {
+        if (block == "") {
+            return;
+        }
+        root.rcm_x = round(mouse_x / 1px) * 1px;
+        root.rcm_y = round(mouse_y / 1px) * 1px;
+        rcm.show();
+    }
+
+    pure function switch_mode(m: RenderMode) -> RenderMode {
+        if (m == RenderMode.Normal) {
+            RenderMode.Slice
+        } else {
+            RenderMode.Normal
+        }
+    }
+
+    in-out property <image> canvas_image;
+
+    in-out property <length> palette_sidebar_width: 300px;
+    in-out property <bool> palette_sidebar_show: false;
+
+    forward-focus: foc;
+
+    VerticalLayout {
+        HorizontalLayout {
+            height: 30px;
+
+            Button {
+                checkable: true;
+                checked: root.palette_sidebar_show;
+                text: "show palette";
+                clicked => {
+                    root.palette_sidebar_show = !root.palette_sidebar_show
+                }
+            }
+
+            Button {
+                text: "switch mode";
+                clicked => {
+                    let opt = root.render_options;
+                    let m = switch_mode(opt.mode);
+                    root.set_render_options({
+                        mode: m,
+                        height: opt.height,
+                        depth_darken: opt.depth-darken,
+                        block_map: opt.block-map,
+                    })
+                }
+            }
+
+            Button {
+                text: "toggle grid";
+                clicked => { root.toggle_grid() }
+            }
+
+            Button {
+                text: "rerender";
+                clicked => {
+                    root.render()
+                }
+            }
+
+            Button {
+                text: "fix palette";
+                clicked => {
+                    root.fix_palette()
+                }
+            }
+        }
+
+        HorizontalLayout {
+            if (root.palette_sidebar_show): HorizontalLayout {
+
+                side := Rectangle {
+                    width: root.palette_sidebar_width;
+                    ListView {
+
+                        for e in root.palette: PaletteRow {
+                            entry: e;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 4px;
+                    background: handle.has-hover || handle.pressed ? darkgrey : #333333;
+
+                    handle := TouchArea {
+                        mouse-cursor: MouseCursor.ew-resize;
+                        moved => {
+                            root.palette_sidebar_width = round(clamp(
+                        root.palette_sidebar_width + self.mouse-x - self.pressed-x,
+                        50px,
+                        600px,
+                        ) / 1px) * 1px
+                        }
+                    }
+                }
+            }
+
+            foc := FocusScope {
+
+                rcm := PopupWindow {
+                    close_policy: close_on_click_outside;
+                    x: root.rcm_x;
+                    y: root.rcm_y;
+                    PopupMenu {
+                        PopupMenuHeading {
+                            text: root.block_at_cursor;
+                        }
+
+                        HRule { }
+
+                        PopupMenuHeading {
+                            text: "x: \{root.world_position.block-x}, z: \{root.world_position.block-z}";
+                        }
+                    }
+                }
+
+                canvas := Rectangle {
+
+                    changed width => {
+                        root.canvas_size_changed(self.width / 1px, self.height / 1px);
+                    }
+                    changed height => {
+                        root.canvas_size_changed(self.width / 1px, self.height / 1px);
+                    }
+
+                    Image {
+                        // horizontal-stretch: 1;
+                        vertical-stretch: 1;
+                        image-fit: ImageFit.preserve;
+                        source: root.canvas_image;
+
+                        touch := TouchArea {
+                            pointer-event(event) => {
+
+                                root.pointer_event(event.kind, event.button, event.modifiers, self.mouse_x / 1px, self.mouse_y / 1px, );
+                                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                                    root.show_rcm(root.block_at_cursor, self.mouse_x, self.mouse-y);
+                                }
+                            }
+                            scroll-event(event) => {
+                                if (event.modifiers.control && root.render_options.mode == RenderMode.Slice) {
+                                    let d = root.sign(event.delta-y / 1px);
+                                    root.change_slice_height(-d)
+                                } else {
+                                    if (event.delta-y < 0) {
+                                        root.decrease_scale(self.mouse-x, self.mouse-y, true)
+                                    } else {
+                                        root.increase_scale(self.mouse-x, self.mouse-y, true)
+                                    }
+                                }
+                                accept
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            padding: 4px;
+            height: 24px;
+            vertical-stretch: 0;
+            if (root.block_at_cursor != ""):
+            Text {
+                text: root.block_at_cursor;
+            }
+            Rectangle { }
+
+            Text {
+                vertical-alignment: TextVerticalAlignment.center;
+                text: root.fmt_world_position(root.world_position);
+            }
+        }
+    }
+}

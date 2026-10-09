@@ -1,0 +1,13 @@
+[package]
+name = "mca_tools"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+cautious_unsafe = []
+
+[dependencies]
+nbt = {path = "../nbt/"}
+bytemuck = "1.25"
+libdeflater = {version = "1.26", features = ["freestanding"]}
+anyhow = "1"

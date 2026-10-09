@@ -1,8 +1,8 @@
 #![allow(unused)]
+extern crate self as nbt;
 
 use std::{default, fmt::Debug, io::Write, marker::PhantomData, ops::Deref};
 pub mod arrays;
-mod de_std_impls;
 mod error;
 mod helper;
 mod serialize;
@@ -10,8 +10,10 @@ pub use helper::*;
 pub use serialize::*;
 mod deserialize;
 pub use deserialize::*;
-mod unsafe_de_reuse;
-pub use unsafe_de_reuse::*;
+mod const_bytes;
+pub use const_bytes::*;
+mod raw_str;
+pub use raw_str::*;
 
 pub use error::*;
 
@@ -37,7 +39,8 @@ pub enum Tag {
 }
 
 impl Tag {
-    const fn fixed_size(&self) -> Option<usize> {
+    #[inline]
+    const fn fixed_size(self) -> Option<usize> {
         match self {
             Tag::Byte => Some(1),
             Tag::Short => Some(2),
@@ -52,7 +55,9 @@ impl Tag {
 
 impl TryFrom<u8> for Tag {
     type Error = crate::DeserializationError;
+    #[inline]
     fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+        // TODO: investigate whether i can do some unhinged optimization here
         match value {
             0 => Ok(Tag::End),
             1 => Ok(Tag::Byte),
@@ -72,11 +77,29 @@ impl TryFrom<u8> for Tag {
     }
 }
 
-pub fn from_bytes<'d, T: DeserializePayload<'d> + Default>(
-    data: &'d [u8],
-) -> DeserializationResult<(&'d str, T, usize)> {
-    let t = T::default();
+pub trait DeserializeExt<'d>: DeserializePayload<'d> + Sized {
+    fn try_deserialize_into(
+        mut self,
+        data: &'d [u8],
+    ) -> (Self, Result<(&'d str, usize), DeserializationError>) {
+        // would maybe be nicer if the Self was "inside" the result variants (the way you can get the sent
+        // value back on a TrySendError on channels)
+        //
+        // but here, you want to get the value back in any case, so idk what the most ergonomic API
+        // would be. this seems annoying (can't use ?), but pretty much always having to match Ok and
+        // Err to retrieve the Self also seems annoying? maybe getting the Self out of the tuples .0
+        // unconditionally, and then matching on .1 is fine?
+        let r = try_deserialize_into_inner(&mut self, data);
+        (self, r)
+    }
+}
 
+impl<'d, T: DeserializePayload<'d>> DeserializeExt<'d> for T {}
+
+fn try_deserialize_into_inner<'d, T: DeserializePayload<'d>>(
+    t: &mut T,
+    data: &'d [u8],
+) -> DeserializationResult<(&'d str, usize)> {
     if data.len() < 4 {
         // the shortest possible fully formed tag is a byte tag with:
         // 1 byte Tag::Byte, 2 bytes name length (min. 0), 1 byte payload
@@ -86,7 +109,32 @@ pub fn from_bytes<'d, T: DeserializePayload<'d> + Default>(
 
     let tag = Tag::try_from(data[0])?;
 
-    if tag == Tag::End {
+    if tag != T::TAG {
+        return Err(DeserializationError::UnexpectedTag(tag as u8));
+    };
+
+    let mut off = 1;
+    let (name, k) = deserialize_nbt_str(&data[off..])?;
+    off += k;
+
+    off += t.deserialize_payload(&data[off..])?;
+
+    Ok((name, off))
+}
+
+pub fn from_bytes<'d, T: DeserializePayload<'d> + Default>(
+    data: &'d [u8],
+) -> DeserializationResult<(&'d str, T, usize)> {
+    if data.len() < 4 {
+        // the shortest possible fully formed tag is a byte tag with:
+        // 1 byte Tag::Byte, 2 bytes name length (min. 0), 1 byte payload
+        // thus 4 total
+        return Err(DeserializationError::EOF);
+    };
+
+    let tag = Tag::try_from(data[0])?;
+
+    if tag != T::TAG {
         return Err(DeserializationError::UnexpectedTag(tag as u8));
     };
 
@@ -101,82 +149,144 @@ pub fn from_bytes<'d, T: DeserializePayload<'d> + Default>(
     Ok((name, payload, off))
 }
 
-/// any type implementing this trait will implement DeserializePayload via a blanket implementation,
-/// which will expect exactly the specified tag TAG and payload bytes BYTES. if the found payload
-/// bytes are different from BYTES, then DeserializationError::Custom containing ERR_MSG will
-/// be returned.
-///
-/// example:
-/// ```
-/// #[derive(Default)]
-/// pub struct StatusMinecraftFull;
-///
-/// impl nbt::ConstBytes for StatusMinecraftFull {
-///     const TAG: nbt::Tag = nbt::Tag::String;
-///     const BYTES: &'static [u8] = b"\x00\x0eminecraft:full";
-///     const ERR_MSG: Option<&'static str> = Some("status not minecraft:full");
-/// }
-/// ```
-pub trait ConstBytes {
-    const TAG: Tag;
-    const BYTES: &'static [u8];
-    const ERR_MSG: Option<&'static str> = None;
+/// required trait for optional fields (with attribute #[nbt(optional)]). failure to implement
+/// this trait on a field that is marked with #[nbt(optional)] will be a compile error.
+pub trait Optional {
+    /// will be called to set the value on an optional field, if no value was deserialized.
+    fn handle_absent(&mut self);
+    /// will be called before during. the entire field (type tag, name and payload) will
+    /// only be serialized if is_present returns true.
+    fn is_present(&self) -> bool;
 }
 
-impl<'d, C: ConstBytes + Default> DeserializePayload<'d> for C {
-    const TAG: Tag = C::TAG;
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> DeserializationResult<usize> {
-        if data.len() < C::BYTES.len() {
-            return Err(DeserializationError::EOF);
+impl<T> Optional for Option<T> {
+    #[inline]
+    fn handle_absent(&mut self) {
+        *self = None
+    }
+    fn is_present(&self) -> bool {
+        self.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip_helper<T>(root_name: &str, t: T)
+    where
+        T: SerializePayload + for<'d> DeserializePayload<'d> + Default + PartialEq + Debug,
+    {
+        let serialized = nbt::to_bytes(root_name, &t).expect("should serialize without error");
+
+        let (root_name_de, t_de, bytes_consumed) =
+            nbt::from_bytes::<T>(&serialized).expect("should deserialize without error");
+
+        assert_eq!(root_name, root_name_de);
+        assert_eq!(serialized.len(), bytes_consumed);
+        assert_eq!(t, t_de);
+    }
+
+    #[test]
+    fn simple() {
+        #[derive(SerializePayload, DeserializePayload, Default, PartialEq, Debug)]
+        struct Data {
+            byte: i8,
+            short: i16,
+            int: i32,
+            long: i64,
+            float: f32,
+            double: f64,
+            string: String,
+        }
+
+        let data = Data {
+            byte: 0,
+            short: 1,
+            int: 3,
+            long: 4,
+            float: 4.0,
+            double: 5.0,
+            string: "6".into(),
+        };
+        roundtrip_helper("root", data);
+    }
+
+    #[test]
+    fn nested() {
+        #[derive(SerializePayload, DeserializePayload, Default, PartialEq, Debug)]
+        struct Outer {
+            inner: Inner,
+        }
+        #[derive(SerializePayload, DeserializePayload, Default, PartialEq, Debug)]
+        struct Inner {
+            a: i32,
+        }
+
+        let outer = Outer {
+            inner: Inner { a: 17 },
         };
 
-        if C::BYTES == &data[0..C::BYTES.len()] {
-            Ok(C::BYTES.len())
-        } else {
-            Err(DeserializationError::Custom(
-                C::ERR_MSG.unwrap_or("ConstBytes mismatch").into(),
-            ))
-        }
+        roundtrip_helper("", outer);
     }
-}
 
-/// raw nbt string bytes, not checked for utf8
-/// (which is surprisingly expensive with the std implementation)
-#[derive(Default, Debug)]
-pub struct RawString<'a>(&'a [u8]);
-
-impl<'a> RawString<'a> {
-    // getting lifetime issues with the deref
-    pub fn inner_lifetimed(&self) -> &'a [u8] {
-        self.0
-    }
-}
-
-impl<'a> Deref for RawString<'a> {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        self.0
-    }
-}
-
-unsafe impl<'d> DeserializeReuse for RawString<'d> {
-    type Borrow<'b> = RawString<'b>;
-}
-
-impl<'d> DeserializePayload<'d> for RawString<'d> {
-    const TAG: Tag = Tag::String;
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> DeserializationResult<usize> {
-        if data.len() < 2 {
-            return Err(DeserializationError::EOF);
-        }
-        let l = u16::from_be_bytes(data[0..2].try_into().unwrap()) as usize;
-
-        if data.len() < l + 2 {
-            return Err(DeserializationError::EOF);
+    #[test]
+    fn optional() {
+        #[derive(SerializePayload, DeserializePayload, Default, PartialEq, Debug, Clone)]
+        struct Data {
+            #[nbt(optional)]
+            some_field: Option<i32>,
+            other_field: String,
         }
 
-        self.0 = &data[2..l + 2];
+        let mut data = Data {
+            some_field: Some(17),
+            other_field: "abc".into(),
+        };
+        roundtrip_helper("root", data.clone());
 
-        Ok(l + 2)
+        data.some_field = None;
+        roundtrip_helper("root", data.clone());
+
+        let bs = nbt::to_bytes("root", &data).unwrap();
+
+        // same as Data, except some_field is not actually marked as optional
+        #[derive(DeserializePayload, Default, PartialEq, Debug, Clone)]
+        struct Data2 {
+            some_field: Option<i32>,
+            other_field: String,
+        }
+
+        let r = nbt::from_bytes::<Data2>(bs.as_slice());
+        std::assert_matches!(r, Err(nbt::DeserializationError::FieldNotFound(_)));
+
+        // yes this is a bit confusing, not a huge fan
+        // but i don't think there really is a clean way of detecting particular types in a proc
+        // macro? so you are kind of forced to use an extra attribute to mark optional fields, but
+        // then you can have a field that uses Option but is not really optional semantically during
+        // deserialization
+        //
+        // the whole serialization side of this is a bit of an afterthought, i just wanted fast
+        // deserialization
+    }
+
+    #[test]
+    fn rename() {
+        #[derive(DeserializePayload, SerializePayload, Debug, Default, PartialEq)]
+        struct Meme {
+            #[nbt(rename = "cool")]
+            very: i32,
+        }
+
+        let m = Meme { very: 0 };
+
+        let d = nbt::to_bytes("", &m).unwrap();
+
+        let expected = b"\x0A\x00\x00\x03\x00\x04cool";
+        assert!(d.len() > expected.len());
+
+        assert_eq!(&d[..expected.len()], expected);
+
+        roundtrip_helper("", m);
     }
 }

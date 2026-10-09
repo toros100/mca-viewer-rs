@@ -1,0 +1,77 @@
+export component PopupMenu inherits Rectangle {
+    border-width: 1px;
+    border-color: black;
+    border-radius: 6px;
+    height: 100%;
+    width: 100%;
+    background: #272727;
+    drop-shadow-color: #00000055;
+    drop-shadow-blur: 6px;
+    clip: true;
+    VerticalLayout {
+        padding: 4px;
+        spacing: 0px;
+        height: 100%;
+        width: 100%;
+        cross-axis-alignment: center;
+        @children
+    }
+}
+
+export component PopupMenuHeading {
+    in property <string> text;
+    width: 100%;
+    VerticalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        Text {
+            text: root.text;
+            vertical-alignment: TextVerticalAlignment.center;
+        }
+    }
+}
+
+export component PopupMenuButton {
+    callback clicked();
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <color> text_color_enabled: #EEEEEE;
+    in property <color> text_color_disabled: #888888;
+    in property <color> background: #00000000;
+    in property <color> background_hovered: #454545;
+
+    in property <length> padding_lr: 6px;
+    in property <length> padding_tb: 2px;
+
+    width: 100%;
+
+    VerticalLayout {
+        padding: 0px;
+        Rectangle {
+            background: t.has-hover && enabled ? root.background_hovered : root.background;
+            border-radius: 2px;
+            t := TouchArea {
+                enabled: root.enabled;
+                mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+                VerticalLayout {
+                    height: 100%;
+                    width: 100%;
+                    alignment: center;
+                    padding-left: root.padding_lr;
+                    padding-right: root.padding_lr;
+                    padding-top: root.padding_tb;
+                    padding-bottom: root.padding_tb;
+
+                    Text {
+                        vertical-alignment: center;
+                        horizontal-alignment: left;
+                        color: root.enabled ? root.text_color_enabled : root.text_color_disabled;
+                        text: root.label;
+                    }
+                }
+
+                clicked => { root.clicked() }
+            }
+        }
+    }
+}

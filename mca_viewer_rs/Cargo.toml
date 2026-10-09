@@ -1,0 +1,50 @@
+[package]
+name = "mca_viewer_rs"
+version = "0.1.0"
+edition = "2024"
+default-run = "mca_viewer_rs"
+
+[features]
+cautious_unsafe = []
+
+[[bin]]
+name = "sim"
+
+[dependencies]
+nbt = {path = "../nbt"}
+mca_tools = {path = "../mca_tools/"}
+
+slint = {version = "~1.17", default-features = false, features = [
+"compat-1-2",
+"unstable-wgpu-29",
+"renderer-femtovg-wgpu",
+"backend-winit-wayland",
+"live-preview",
+]}
+
+vello = {version = "~0.10", default-features = false, features = ["wgpu"]}
+parley = "0.11"
+serde = "1"
+bytemuck = {version = "1.25", features = ["derive"]}
+clap = {version = "4.6", features = ["derive"]}
+image = {version = "0.25", default-features = false}
+anyhow = "1"
+libdeflater = {version = "1.25", features = ["freestanding"]}
+toml = "1.1"
+crossbeam-channel = "0.5"
+rustc-hash = "2.1.2"
+hashbrown = "0.17.1"
+rand = "0.10.1"
+static_assertions = "1"
+parking_lot = "0.12.5"
+thiserror = "2"
+
+[build-dependencies]
+slint-build = "1.17"
+
+[lints]
+workspace = true
+
+[package.metadata.wgsl-analyzer]
+edition = "2026_pre"
+root = "src"

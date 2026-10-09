@@ -1,5 +1,5 @@
 [workspace]
-members = ["mca-viewer-rs", "nbt", "nbt-derive"]
+members = ["mca_viewer_rs", "nbt", "nbt_derive", "mca_tools"]
 resolver = "3"
 
 [profile.best]
@@ -11,3 +11,10 @@ lto = "fat"
 inherits = "release"
 debug = true
 strip = false
+
+[workspace.lints.clippy]
+large_types_passed_by_value = "warn"
+large_stack_arrays = "warn"
+needless_pass_by_value = "warn"
+trivially_copy_pass_by_ref = "warn"
+large_stack_frames = "warn"
