@@ -1,71 +1,127 @@
-// simulating the workload the workload in a simplified way for profiling
-// WARN: single threaded simulation
-
-use std::{hint::black_box, path::PathBuf};
+use std::path::PathBuf;
+use std::time::Instant;
 
 use clap::Parser;
-use mca_tools::loader::McaLoader;
-use mca_viewer_rs::block_map::BlockMap;
-use mca_viewer_rs::draw_region::draw_region;
-use mca_viewer_rs::palette::BlockPalette;
-use mca_viewer_rs::palette::TomlPalette;
-use mca_viewer_rs::region::Region;
-use mca_viewer_rs::region::parse_regions_in_dir;
+use mca_viewer_rs::{
+    palette::{BlockPalette, TomlPalette},
+    region::{Region, RegionRange, parse_regions_in_dir},
+    worker::{Notify, RenderCtx, RenderOptions, View},
+};
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 #[derive(clap::Parser)]
 struct Args {
     /// Path to a directory containing region files (*.mca)
-    #[arg(long)]
+    #[arg(long, short)]
     path: PathBuf,
+
+    /// Number of worker threads (omit to use std::thread::available_parallelism())
+    #[arg(long, short)]
+    num_workers: Option<NonZeroUsize>,
+
+    /// Number of repetitions
+    #[arg(long, short, default_value_t = NonZeroUsize::new(1).unwrap())]
+    repeat: NonZeroUsize,
+
+    #[arg(long, short)]
+    slice_height: Option<u16>,
 }
 
-struct Worker {
-    img: image::RgbaImage,
-    loader: McaLoader,
-    color_lookup: BlockMap,
+#[derive(Clone)]
+struct DummyRenderCtx;
+impl RenderCtx<()> for DummyRenderCtx {
+    fn upload_tile(&self, _: &[u8], _: u32, _: u32) {}
 }
 
-impl Worker {
-    fn default() -> Self {
-        Self {
-            img: image::RgbaImage::new(512, 512),
-            loader: McaLoader::default(),
-            color_lookup: Default::default(),
-        }
-    }
-
-    fn render_region(&mut self, r: &Region, ctx: &BlockPalette) -> anyhow::Result<()> {
-        black_box(draw_region(
-            r,
-            &mut self.img,
-            &mut self.loader,
-            &mut self.color_lookup,
-            true,
-            true,
-            ctx,
-        ))
-        .map(|_| ())
-    }
+#[derive(Clone)]
+struct DummyNotify;
+impl Notify for DummyNotify {
+    fn notify(&self) {}
 }
 
 fn main() -> anyhow::Result<()> {
-    let ctx = BlockPalette::new(
+    let palette = Arc::new(BlockPalette::new(
         toml::from_str::<TomlPalette>(include_str!("../../palette.toml"))?,
         [255, 0, 255, 255],
-    );
+    ));
 
     let args = Args::parse();
+    let regions = parse_regions_in_dir(&args.path)?.collect::<Arc<[_]>>();
 
-    let regions = parse_regions_in_dir(&args.path)?;
+    if regions.is_empty() {
+        anyhow::bail!("no regions found");
+    }
 
-    render_all(black_box(regions), &ctx);
+    let p = regions[0].pos();
+
+    let (min_x, max_x, min_z, max_z) = regions
+        .iter()
+        .map(Region::pos)
+        .fold((p.x, p.x, p.z, p.z), |a, r| {
+            (a.0.min(r.x), a.1.max(r.x), a.2.min(r.z), a.3.max(r.z))
+        });
+
+    let rg = RegionRange::new(min_x, max_x, min_z, max_z);
+    let view = View::new(rg, rg);
+
+    let num_workers = args.num_workers.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .unwrap_or(const { std::num::NonZeroUsize::new(1).unwrap() })
+    });
+
+    println!("{} regions", regions.len());
+    println!("num_workers: {:?}", num_workers.get());
+    println!("repeat: {:?}", args.repeat.get());
+
+    let (mut h, mut m) = mca_viewer_rs::worker::Manager::<
+        DummyNotify,
+        BlockPalette,
+        DummyRenderCtx,
+        (),
+    >::new(DummyNotify, DummyRenderCtx, num_workers);
+
+    let _ = std::thread::spawn(move || m.run());
+
+    let opt = if let Some(h) = args.slice_height {
+        RenderOptions {
+            mode: mca_viewer_rs::worker::RenderMode::Slice,
+            slice_height: h,
+            ..Default::default()
+        }
+    } else {
+        RenderOptions::default()
+    };
+
+    let mut timings = Vec::with_capacity(regions.len());
+
+    for i in 0..args.repeat.get() {
+        let mut expecting = regions.len();
+        h.send_task(regions.clone(), opt, view, palette.clone(), true);
+
+        timings.clear();
+        let before = Instant::now();
+        while expecting > 0 {
+            match h.recv_result() {
+                Err(crossbeam_channel::RecvError) => {
+                    anyhow::bail!("channel disconnected")
+                }
+                Ok(r) => {
+                    if r.inner.is_ok() {
+                        timings.push(r.time)
+                    }
+                    expecting -= 1;
+                }
+            }
+        }
+
+        let after = before.elapsed();
+
+        timings.sort();
+        let m = timings[timings.len() / 2];
+
+        println!("[{i}] total duration: {after:?}, median region duration: {m:?}");
+    }
 
     Ok(())
-}
-
-fn render_all(regions: impl Iterator<Item = Region>, ctx: &BlockPalette) {
-    let mut worker = Worker::default();
-    for r in regions {
-        _ = worker.render_region(&r, ctx);
-    }
 }

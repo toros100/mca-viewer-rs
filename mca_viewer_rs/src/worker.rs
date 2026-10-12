@@ -1,11 +1,11 @@
 use crate::block_map::{BlockMap, PackedBlockMap};
-use crate::draw_region::{self};
+use crate::draw_region::{self, DrawError};
 use crate::palette::PaletteCtx;
 use crate::region::{Region, RegionPosition, RegionRange};
-use crate::renderer::{GpuTile, RenderCtx};
 use crossbeam_channel::{Receiver, Sender, select_biased};
 use std::collections::HashSet;
 
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -66,6 +66,7 @@ impl View {
         visible: RegionRange::new(0, -1, 0, -1),
         keep: RegionRange::new(0, -1, 0, -1),
     };
+
     pub fn single(x: i32, z: i32) -> Self {
         let rg = RegionRange::new(x, x, z, z);
         Self {
@@ -83,32 +84,26 @@ impl View {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum TileError {
-    #[error("todo")]
-    SomeErrorTodo,
-}
-
-pub struct RegionResult<P> {
+pub struct RegionResult<P, O> {
     task_id: usize,
     pub time: Duration,
-    pub inner: Result<RegionTile<P>, RegionError>,
+    pub inner: Result<RegionTile<P, O>, RegionError>,
 }
 
-pub struct RegionTile<P> {
+pub struct RegionTile<P, O> {
     pub x: i32,
     pub z: i32,
-    pub tile: GpuTile,
+    pub tile: O,
     pub block_map: Option<crate::block_map::PackedBlockMap<P>>,
 }
 
 pub struct RegionError {
     pub x: i32,
     pub z: i32,
-    pub tile: anyhow::Error,
+    pub tile: DrawError,
 }
 
-impl<P> RegionTile<P> {
+impl<P, O> RegionTile<P, O> {
     pub fn pos(&self) -> RegionPosition {
         RegionPosition::new(self.x, self.z)
     }
@@ -128,22 +123,36 @@ pub trait Notify: Send + Clone + 'static {
     fn notify(&self);
 }
 
-struct Worker<N, P> {
+pub trait RenderCtx<O>
+where
+    Self: Send + Clone + 'static,
+    O: Send + 'static,
+{
+    fn upload_tile(&self, data: &[u8], width: u32, height: u32) -> O;
+}
+
+struct Worker<N, P, R, O> {
     img: image::RgbaImage,
     loader: mca_tools::loader::McaLoader,
     lookup: BlockMap,
     notify: N,
     task_rx: Receiver<RegionTask<P>>,
-    results_tx: Sender<RegionResult<P>>,
-    ctx: RenderCtx,
+    results_tx: Sender<RegionResult<P, O>>,
+    ctx: R,
 }
 
-impl<N: Notify, P: PaletteCtx> Worker<N, P> {
+impl<N, P, R, O> Worker<N, P, R, O>
+where
+    N: Notify,
+    P: PaletteCtx,
+    O: Send + 'static,
+    R: RenderCtx<O>,
+{
     fn new(
         notify: N,
         task_rx: Receiver<RegionTask<P>>,
-        results_tx: Sender<RegionResult<P>>,
-        ctx: RenderCtx,
+        results_tx: Sender<RegionResult<P, O>>,
+        ctx: R,
     ) -> Self {
         let img = image::RgbaImage::new(TILE_SIZE, TILE_SIZE);
         let loader = mca_tools::loader::McaLoader::default();
@@ -166,13 +175,13 @@ impl<N: Notify, P: PaletteCtx> Worker<N, P> {
         }
     }
 
-    pub fn send_result(&self, t: RegionResult<P>) {
+    pub fn send_result(&self, t: RegionResult<P, O>) {
         if self.results_tx.send(t).is_ok() {
             self.notify.notify();
         }
     }
 
-    pub fn render_region(&mut self, task: RegionTask<P>) -> RegionResult<P> {
+    pub fn render_region(&mut self, task: RegionTask<P>) -> RegionResult<P, O> {
         let opt = task.options;
         let before = Instant::now();
         let res = match opt.mode {
@@ -203,8 +212,7 @@ impl<N: Notify, P: PaletteCtx> Worker<N, P> {
             None
         };
 
-        let after = Instant::now();
-        let time = after.duration_since(before);
+        let time = before.elapsed();
 
         RegionResult {
             task_id: task.task_id,
@@ -226,29 +234,36 @@ impl<N: Notify, P: PaletteCtx> Worker<N, P> {
     }
 }
 
-pub struct Manager<N, P> {
+pub struct Manager<N, P, R, O> {
     render_task_rx: Receiver<RenderTask<P>>,
     view_update_rx: Receiver<ViewUpdate>,
     already_rendered: HashSet<RegionPosition>,
-    results_tx: Sender<RegionResult<P>>,
+    results_tx: Sender<RegionResult<P, O>>,
     current_task: Option<RenderTask<P>>,
     regions: Vec<usize>,
     next_region: usize,
     notify: N,
     worker_task_tx: Sender<RegionTask<P>>,
     worker_task_rx: Receiver<RegionTask<P>>,
+    _render_ctx: PhantomData<R>,
 }
 
-pub struct ManagerHandle<P> {
+pub struct ManagerHandle<P, O> {
     render_task_tx: Sender<RenderTask<P>>,
     view_update_tx: Sender<ViewUpdate>,
     view_update_rx: Receiver<ViewUpdate>,
-    results_rx: Receiver<RegionResult<P>>,
+    results_rx: Receiver<RegionResult<P, O>>,
     task_id: usize,
 }
 
-impl<N: Notify, P: PaletteCtx + Send + Sync + 'static> Manager<N, P> {
-    pub fn new(notify: N, ctx: &RenderCtx, num_workers: NonZeroUsize) -> (ManagerHandle<P>, Self) {
+impl<N, P, R, O> Manager<N, P, R, O>
+where
+    N: Notify,
+    P: PaletteCtx + Send + Sync + 'static,
+    O: Send + 'static,
+    R: RenderCtx<O>,
+{
+    pub fn new(notify: N, ctx: R, num_workers: NonZeroUsize) -> (ManagerHandle<P, O>, Self) {
         let (render_task_tx, render_task_rx) = crossbeam_channel::bounded(100);
 
         let (view_update_tx, view_update_rx) = crossbeam_channel::bounded(100);
@@ -276,6 +291,7 @@ impl<N: Notify, P: PaletteCtx + Send + Sync + 'static> Manager<N, P> {
             notify,
             worker_task_tx,
             worker_task_rx,
+            _render_ctx: PhantomData,
         };
 
         manager.spawn_workers(num_workers, ctx);
@@ -283,16 +299,18 @@ impl<N: Notify, P: PaletteCtx + Send + Sync + 'static> Manager<N, P> {
         (handle, manager)
     }
 
-    fn spawn_workers(&self, num_workers: NonZeroUsize, ctx: &RenderCtx) {
+    #[allow(clippy::needless_pass_by_value)]
+    fn spawn_workers(&self, num_workers: NonZeroUsize, ctx: R) {
         for _ in 0..num_workers.get() {
             std::thread::spawn({
                 let task_rx = self.worker_task_rx.clone();
                 let results_tx = self.results_tx.clone();
                 let notify = self.notify.clone();
+
                 let ctx = ctx.clone();
 
                 move || {
-                    let mut w = Worker::<N, P>::new(notify, task_rx, results_tx, ctx);
+                    let mut w = Worker::<N, P, R, O>::new(notify, task_rx, results_tx, ctx);
                     w.run()
                 }
             });
@@ -323,7 +341,6 @@ impl<N: Notify, P: PaletteCtx + Send + Sync + 'static> Manager<N, P> {
     pub fn run(&mut self) {
         loop {
             if self.current_task.is_none() {
-                println!("no task");
                 self.idle();
             }
 
@@ -345,7 +362,6 @@ impl<N: Notify, P: PaletteCtx + Send + Sync + 'static> Manager<N, P> {
 
             if self.next_region < self.regions.len()
                 && let Some(task) = self.current_task.as_ref()
-            // .map(|t| t.regions[self.regions[self.next_region]].clone())
             {
                 let id = task.task_id;
                 let region = &task.regions[self.regions[self.next_region]];
@@ -407,7 +423,7 @@ impl<N: Notify, P: PaletteCtx + Send + Sync + 'static> Manager<N, P> {
     }
 }
 
-impl<P: PaletteCtx> ManagerHandle<P> {
+impl<P: PaletteCtx, O> ManagerHandle<P, O> {
     pub fn send_task(
         &mut self,
         regions: Arc<[Region]>,
@@ -446,7 +462,20 @@ impl<P: PaletteCtx> ManagerHandle<P> {
         }
     }
 
-    pub fn try_recv_result(&self) -> Result<RegionResult<P>, crossbeam_channel::TryRecvError> {
+    pub fn recv_result(&self) -> Result<RegionResult<P, O>, crossbeam_channel::RecvError> {
+        loop {
+            match self.results_rx.recv() {
+                Ok(s) => {
+                    if s.task_id == self.task_id {
+                        break Ok(s);
+                    }
+                }
+                Err(e) => break Err(e),
+            }
+        }
+    }
+
+    pub fn try_recv_result(&self) -> Result<RegionResult<P, O>, crossbeam_channel::TryRecvError> {
         loop {
             match self.results_rx.try_recv() {
                 Ok(s) => {

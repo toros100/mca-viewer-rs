@@ -2,7 +2,7 @@ mod slint_conv;
 mod slint_gen;
 
 use mca_viewer_rs::block_id::BlockId;
-use mca_viewer_rs::palette::{BlockPalette, PaletteCtx};
+use mca_viewer_rs::palette::BlockPalette;
 use slint::ModelExt;
 use slint::language::{KeyboardModifiers, PointerEventKind};
 use slint::platform::PointerEventButton;
@@ -20,8 +20,8 @@ use slint::{ComponentHandle, ModelRc, SharedString, ToSharedString, VecModel, We
 use vello::kurbo::Affine;
 
 use mca_viewer_rs::region::{Region, RegionPosition, RegionRange, parse_regions_in_dir};
-use mca_viewer_rs::renderer::Renderer;
-use mca_viewer_rs::worker;
+use mca_viewer_rs::renderer::{GpuTile, Renderer};
+use mca_viewer_rs::worker::{self};
 use mca_viewer_rs::worker::{ManagerHandle, RegionTile, RenderMode, RenderOptions, View};
 
 #[derive(Clone)]
@@ -69,7 +69,7 @@ impl NotifyApp {
 }
 
 pub struct AppHandle {
-    app: Rc<RefCell<App<BlockPalette>>>,
+    app: Rc<RefCell<App>>,
     window: slint_gen::MainWindow,
 }
 
@@ -78,7 +78,7 @@ impl AppHandle {
         Ok(self.window.run()?)
     }
 
-    pub fn borrow_mut(&self) -> RefMut<'_, App<BlockPalette>> {
+    pub fn borrow_mut(&self) -> RefMut<'_, App> {
         self.app.borrow_mut()
     }
 }
@@ -89,27 +89,26 @@ pub fn new(num_workers: NonZeroUsize, palette: Arc<BlockPalette>) -> anyhow::Res
     let app = App::new(&window, num_workers, palette);
 
     app.borrow().register_callbacks()?;
-    app.borrow().register_palette_callbacks();
     app.borrow_mut().refresh_palette_model();
 
     Ok(AppHandle { app, window })
 }
 
-pub struct App<P> {
+pub struct App {
     self_ref: std::rc::Weak<RefCell<Self>>,
     renderer: Option<Renderer>,
     window: Weak<slint_gen::MainWindow>,
-    tiles: HashMap<RegionPosition, RegionTile<P>>,
+    tiles: HashMap<RegionPosition, RegionTile<BlockPalette, GpuTile>>,
     render_options: RenderOptions,
     overlay_scene: vello::Scene,
     canvas_dims: (f32, f32),
     view_affine: kurbo::Affine,
     pan_enter: Option<kurbo::Point>,
-    handle: Option<ManagerHandle<P>>,
+    handle: Option<ManagerHandle<BlockPalette, GpuTile>>,
     view: View,
     notify: NotifyApp,
     regions: Arc<[Region]>,
-    palette: Arc<P>,
+    palette: Arc<BlockPalette>,
     num_workers: NonZeroUsize,
     needs_redraw: bool,
     show_region_grid: bool,
@@ -119,15 +118,39 @@ pub struct App<P> {
     pal_model_internal: Rc<VecModel<PaletteEntry>>,
 }
 
-impl App<BlockPalette> {
-    pub fn register_palette_callbacks(&self) {
-        let app = self.self_ref.upgrade().unwrap();
-
-        self.window.unwrap().on_fix_palette(move || {
-            app.borrow_mut().fix_palette();
+impl App {
+    fn new(
+        window: &slint_gen::MainWindow,
+        num_workers: NonZeroUsize,
+        palette: Arc<BlockPalette>,
+    ) -> Rc<RefCell<Self>> {
+        let notify = NotifyApp::new(window.as_weak());
+        Rc::new_cyclic(|e| {
+            RefCell::new(Self {
+                palette,
+                self_ref: e.clone(),
+                num_workers,
+                renderer: None,
+                render_options: RenderOptions::default(),
+                regions: Arc::default(),
+                view: View::EMPTY,
+                handle: None,
+                window: window.as_weak(),
+                tiles: HashMap::default(),
+                overlay_scene: vello::Scene::default(),
+                canvas_dims: (1., 1.),
+                view_affine: Affine::IDENTITY,
+                pan_enter: None,
+                notify,
+                needs_redraw: true,
+                show_region_grid: false,
+                min_scale_pow: -4,
+                max_scale_pow: 8,
+                curr_scale_pow: 0,
+                pal_model_internal: Default::default(),
+            })
         })
     }
-
     fn refresh_palette_model(&mut self) {
         self.pal_model_internal.clear();
         self.pal_model_internal
@@ -172,41 +195,6 @@ impl App<BlockPalette> {
             let bs = String::from_utf8_lossy(bs);
             println!("[{id:?}] {bs}")
         }
-    }
-}
-
-impl<P: PaletteCtx + Send + Sync + 'static> App<P> {
-    fn new(
-        window: &slint_gen::MainWindow,
-        num_workers: NonZeroUsize,
-        palette: Arc<P>,
-    ) -> Rc<RefCell<Self>> {
-        let notify = NotifyApp::new(window.as_weak());
-        Rc::new_cyclic(|e| {
-            RefCell::new(Self {
-                palette,
-                self_ref: e.clone(),
-                num_workers,
-                renderer: None,
-                render_options: RenderOptions::default(),
-                regions: Arc::default(),
-                view: View::EMPTY,
-                handle: None,
-                window: window.as_weak(),
-                tiles: HashMap::default(),
-                overlay_scene: vello::Scene::default(),
-                canvas_dims: (1., 1.),
-                view_affine: Affine::IDENTITY,
-                pan_enter: None,
-                notify,
-                needs_redraw: true,
-                show_region_grid: false,
-                min_scale_pow: -4,
-                max_scale_pow: 8,
-                curr_scale_pow: 0,
-                pal_model_internal: Default::default(),
-            })
-        })
     }
 
     pub fn update_render_options(&mut self, opt: RenderOptions) {
@@ -287,14 +275,20 @@ impl<P: PaletteCtx + Send + Sync + 'static> App<P> {
         if let Some(t) = self.tiles.get(&RegionPosition::new(region_x, region_z))
             && let Some(b) = &t.block_map
         {
-            let (_, bs) = b.get(block_x_in_region as usize, block_z_in_region as usize);
+            let (id, bs) = b.get(block_x_in_region as usize, block_z_in_region as usize);
+
+            let has_color = self.palette.has_color(id);
+
             if let Some(bytes) = bs {
                 // could maybe keep these shared strings around to avoid re-allocating them each
                 // time, but it probably doesnt matter at all
                 let name = String::from_utf8_lossy(bytes).to_shared_string();
-                window.set_block_at_cursor(name);
+                window.set_block_at_cursor(slint_gen::BlockAtCursor { name, has_color });
             } else {
-                window.set_block_at_cursor("".into());
+                window.set_block_at_cursor(slint_gen::BlockAtCursor {
+                    name: "".into(),
+                    has_color: false,
+                });
             }
         }
 
@@ -414,8 +408,6 @@ impl<P: PaletteCtx + Send + Sync + 'static> App<P> {
         if self.show_region_grid {
             for pos in self.tiles.keys() {
                 if self.view.visible.contains(*pos) {
-                    // pixel alignment to get very nice crisp boxes
-
                     if self.curr_scale_pow > -2 {
                         for chunk_x in 0..32 {
                             for chunk_z in 0..32 {
@@ -442,6 +434,7 @@ impl<P: PaletteCtx + Send + Sync + 'static> App<P> {
                         }
                     }
 
+                    // pixel alignment to get very nice crisp boxes
                     let r =
                         rounded_affine.transform_rect_bbox(pos.rect()) + kurbo::Vec2::splat(0.5);
 
@@ -486,12 +479,12 @@ impl<P: PaletteCtx + Send + Sync + 'static> App<P> {
         device: wgpu::Device,
         queue: wgpu::Queue,
     ) -> Result<(), Box<dyn Error>> {
-        let exp = Renderer::new(device, queue);
-        let ctx = exp.ctx();
-        self.renderer = Some(exp);
+        let renderer = Renderer::new(device, queue);
+        let ctx = renderer.ctx();
+        self.renderer = Some(renderer);
 
         let (handle, mut manager) =
-            worker::Manager::new(self.notify.clone(), &ctx, self.num_workers);
+            worker::Manager::new(self.notify.clone(), ctx, self.num_workers);
 
         self.handle = Some(handle);
 
@@ -578,6 +571,13 @@ impl<P: PaletteCtx + Send + Sync + 'static> App<P> {
             let app = app.clone();
             move || {
                 app.borrow_mut().handle_notification();
+            }
+        });
+
+        window.on_fix_palette({
+            let app = app.clone();
+            move || {
+                app.borrow_mut().fix_palette();
             }
         });
 

@@ -50,7 +50,10 @@ pub fn derive_deserialize_payload_inner(
                 };
 
                 if <#ty as ::nbt::DeserializePayload>::TAG != t {
-                    return Err(::nbt::DeserializationError::UnexpectedTag(t as u8))
+                    return Err(::nbt::DeserializationError::UnexpectedTag{
+                        expected: <#ty as ::nbt::DeserializePayload>::TAG,
+                        found: t,
+                    })
                 };
 
                 off += self.#field_ident.deserialize_payload(&data[off..])?;

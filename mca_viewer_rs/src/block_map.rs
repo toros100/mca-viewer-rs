@@ -201,7 +201,7 @@ const fn u64s_required(num_elements: usize, bit_width: usize) -> usize {
     (num_elements).div_ceil(64 / bit_width)
 }
 
-#[inline(always)]
+#[inline]
 fn pack_width_8(m: &BlockIdMapping) -> Vec<u64> {
     let mut packed = Vec::with_capacity(512 * 512 / 8);
     packed.extend(
@@ -214,7 +214,7 @@ fn pack_width_8(m: &BlockIdMapping) -> Vec<u64> {
     packed
 }
 
-#[inline(always)]
+#[inline]
 fn pack_dispatch(m: &BlockIdMapping, bit_width: usize) -> Vec<u64> {
     debug_assert!(
         (1..=12).contains(&bit_width),
@@ -247,7 +247,7 @@ fn pack_dispatch(m: &BlockIdMapping, bit_width: usize) -> Vec<u64> {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn pack_width_generic<const BIT_WIDTH: usize, const NUMS_PER_U64: usize>(
     m: &BlockIdMapping,
 ) -> Vec<u64> {

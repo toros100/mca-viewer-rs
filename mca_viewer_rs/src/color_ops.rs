@@ -1,6 +1,6 @@
 use crate::cfg_unreachable;
 
-#[inline(always)]
+#[inline]
 fn alpha_water_dark_branchless(depth: u16) -> u8 {
     // totally necessary optimization lol
     const VALS: [u8; 25] = [
@@ -22,7 +22,7 @@ fn alpha_water_dark(depth: u16) -> u8 {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn alpha_water_transparency(depth: u16) -> u8 {
     match depth {
         0 => 140,
@@ -34,9 +34,9 @@ fn alpha_water_transparency(depth: u16) -> u8 {
     }
 }
 
-#[inline(always)]
+#[inline]
 /// m must be in -3..=3
-pub(crate) fn modulate_col(col: [u8; 4], m: i8) -> [u8; 4] {
+pub(crate) fn modulate_color(col: [u8; 4], m: i8) -> [u8; 4] {
     // roughly brightens/darkens a color
     // SCALE_133 is roughly 133%
     // im sure this does not make any sense in color theory
@@ -49,14 +49,14 @@ pub(crate) fn modulate_col(col: [u8; 4], m: i8) -> [u8; 4] {
     const SCALE_81: u32 = 207;
     const SCALE_73: u32 = 187;
 
-    #[inline(always)]
+    #[inline]
     fn apply_one<const C: u32>(a: u8) -> u8 {
         // for the three constants that fit into u8, the min(255) is unnecessary
         // luckily, the compiler figures it out: https://godbolt.org/z/jYPGEfbcv
         (((a as u32) * C + 128) >> 8).min(255) as u8
     }
 
-    #[inline(always)]
+    #[inline]
     fn apply_rgb<const C: u32>(col: [u8; 4]) -> [u8; 4] {
         [
             apply_one::<C>(col[0]),
@@ -78,7 +78,7 @@ pub(crate) fn modulate_col(col: [u8; 4], m: i8) -> [u8; 4] {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn alpha_blend(c: u8, d: u8, alpha: u8) -> u8 {
     let c = (c as u32) * (alpha as u32);
     let d = (d as u32) * (255 - alpha as u32);
@@ -86,38 +86,38 @@ fn alpha_blend(c: u8, d: u8, alpha: u8) -> u8 {
     ((sum + (sum >> 8)) >> 8) as u8
 }
 
-#[inline(always)]
-fn alpha_blend_cols(c_1: [u8; 4], c_2: [u8; 4], alpha: u8) -> [u8; 4] {
+#[inline]
+fn alpha_blend_colors(c_1: [u8; 4], c_2: [u8; 4], alpha: u8) -> [u8; 4] {
     let r = alpha_blend(c_1[0], c_2[0], alpha);
     let g = alpha_blend(c_1[1], c_2[1], alpha);
     let b = alpha_blend(c_1[2], c_2[2], alpha);
     [r, g, b, 255]
 }
 
-#[inline(always)]
+#[inline]
 pub(crate) fn calc_water_color(water_col: [u8; 4], block_col: [u8; 4], depth: u16) -> [u8; 4] {
-    let water_col_dark = alpha_blend_cols(water_col, [0, 0, 0, 255], 153);
+    let water_col_dark = alpha_blend_colors(water_col, [0, 0, 0, 255], 153);
 
-    let darkened_water_col = alpha_blend_cols(
+    let darkened_water_col = alpha_blend_colors(
         water_col,
         water_col_dark,
         alpha_water_dark_branchless(depth),
     );
 
-    alpha_blend_cols(
+    alpha_blend_colors(
         block_col,
         darkened_water_col,
         alpha_water_transparency(depth),
     )
 }
 
-#[inline(always)]
-pub(crate) fn soft_depth_darken_col(c: [u8; 4], depth: u16) -> [u8; 4] {
+#[inline]
+pub(crate) fn soft_depth_darken_color(c: [u8; 4], depth: u16) -> [u8; 4] {
     let alpha = alpha_soft_depth_darken_branchless(depth);
-    alpha_blend_cols(c, [0, 0, 0, 255], alpha)
+    alpha_blend_colors(c, [0, 0, 0, 255], alpha)
 }
 
-#[inline(always)]
+#[inline]
 fn alpha_soft_depth_darken_branchless(depth: u16) -> u8 {
     const VALS: [u8; 29] = [
         255, 255, 255, 245, 245, 245, 245, 245, 180, 180, 180, 180, 180, 180, 180, 180, 130, 130,

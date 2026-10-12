@@ -72,55 +72,44 @@ impl TryFrom<u8> for Tag {
             10 => Ok(Tag::Compound),
             11 => Ok(Tag::IntArray),
             12 => Ok(Tag::LongArray),
-            v => Err(DeserializationError::UnexpectedTag(v)),
+            v => Err(DeserializationError::InvalidTag(v)),
         }
     }
 }
 
 pub trait DeserializeExt<'d>: DeserializePayload<'d> + Sized {
     fn try_deserialize_into(
-        mut self,
+        &mut self,
         data: &'d [u8],
-    ) -> (Self, Result<(&'d str, usize), DeserializationError>) {
-        // would maybe be nicer if the Self was "inside" the result variants (the way you can get the sent
-        // value back on a TrySendError on channels)
-        //
-        // but here, you want to get the value back in any case, so idk what the most ergonomic API
-        // would be. this seems annoying (can't use ?), but pretty much always having to match Ok and
-        // Err to retrieve the Self also seems annoying? maybe getting the Self out of the tuples .0
-        // unconditionally, and then matching on .1 is fine?
-        let r = try_deserialize_into_inner(&mut self, data);
-        (self, r)
+    ) -> Result<(&'d str, usize), DeserializationError> {
+        if data.len() < 4 {
+            // the shortest possible fully formed tag is a byte tag with:
+            // 1 byte Tag::Byte, 2 bytes name length (min. 0), 1 byte payload
+            // thus 4 total
+            return Err(DeserializationError::EOF);
+        };
+
+        let tag = Tag::try_from(data[0])?;
+
+        if tag != Self::TAG {
+            eprintln!("wrong tag at root wtf");
+            return Err(DeserializationError::UnexpectedTag {
+                expected: Self::TAG,
+                found: tag,
+            });
+        };
+
+        let mut off = 1;
+        let (name, k) = deserialize_nbt_str(&data[off..])?;
+        off += k;
+
+        off += self.deserialize_payload(&data[off..])?;
+
+        Ok((name, off))
     }
 }
 
 impl<'d, T: DeserializePayload<'d>> DeserializeExt<'d> for T {}
-
-fn try_deserialize_into_inner<'d, T: DeserializePayload<'d>>(
-    t: &mut T,
-    data: &'d [u8],
-) -> DeserializationResult<(&'d str, usize)> {
-    if data.len() < 4 {
-        // the shortest possible fully formed tag is a byte tag with:
-        // 1 byte Tag::Byte, 2 bytes name length (min. 0), 1 byte payload
-        // thus 4 total
-        return Err(DeserializationError::EOF);
-    };
-
-    let tag = Tag::try_from(data[0])?;
-
-    if tag != T::TAG {
-        return Err(DeserializationError::UnexpectedTag(tag as u8));
-    };
-
-    let mut off = 1;
-    let (name, k) = deserialize_nbt_str(&data[off..])?;
-    off += k;
-
-    off += t.deserialize_payload(&data[off..])?;
-
-    Ok((name, off))
-}
 
 pub fn from_bytes<'d, T: DeserializePayload<'d> + Default>(
     data: &'d [u8],
@@ -135,7 +124,10 @@ pub fn from_bytes<'d, T: DeserializePayload<'d> + Default>(
     let tag = Tag::try_from(data[0])?;
 
     if tag != T::TAG {
-        return Err(DeserializationError::UnexpectedTag(tag as u8));
+        return Err(DeserializationError::UnexpectedTag {
+            expected: T::TAG,
+            found: tag,
+        });
     };
 
     let mut off = 1;

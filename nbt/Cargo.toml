@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 nbt_derive = {path = "../nbt_derive/"}
 thiserror = "2.0.18"
+arrayvec = "0.7.8"
 
 [dev-dependencies]
 rand = "0.10.1"

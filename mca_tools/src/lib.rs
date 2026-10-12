@@ -1,5 +1,4 @@
 pub mod bitpack;
-pub mod chunk;
 pub mod loader;
 
 /// regular `unreachable!()` if  the cautious_unsafe feature is enabled, otherwise `unreachable_unchecked()`

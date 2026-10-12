@@ -1,7 +1,7 @@
 use slint::wgpu_30::wgpu;
 use vello::kurbo::Rect;
 mod wgpu_render;
-pub use wgpu_render::{GpuTile, RenderCtx};
+pub use wgpu_render::{GpuTile, WgpuRenderCtx};
 
 pub const TEX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
@@ -29,7 +29,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn ctx(&self) -> RenderCtx {
+    pub fn ctx(&self) -> WgpuRenderCtx {
         self.wgpu_renderer.ctx()
     }
 

@@ -2,6 +2,8 @@ pub mod block_id;
 pub mod block_map;
 pub mod color_ops;
 
+pub mod chunk;
+
 pub mod draw_region;
 pub mod palette;
 pub mod region;

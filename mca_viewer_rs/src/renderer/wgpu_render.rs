@@ -1,6 +1,8 @@
 use slint::wgpu_30::wgpu;
 use vello::kurbo::Rect;
 
+use crate::worker::RenderCtx;
+
 const TILES_MODULE_DESCR: wgpu::ShaderModuleDescriptor = wgpu::include_wgsl!("tiles.wgsl");
 
 const TILE_USAGE: wgpu::TextureUsages =
@@ -26,13 +28,13 @@ pub struct GpuTile {
 }
 
 #[derive(Clone)]
-pub struct RenderCtx {
+pub struct WgpuRenderCtx {
     device: wgpu::Device,
     queue: wgpu::Queue,
     tile_bgl: wgpu::BindGroupLayout,
 }
 
-impl RenderCtx {
+impl WgpuRenderCtx {
     pub fn upload_tile(&self, rgba: &[u8], width: u32, height: u32) -> GpuTile {
         WgpuRenderer::upload_tile_inner(
             &self.tile_bgl,
@@ -45,6 +47,12 @@ impl RenderCtx {
     }
     pub fn update_tile(&self, tile: &GpuTile, rgba: &[u8]) {
         WgpuRenderer::update_tile(&self.queue, tile, rgba);
+    }
+}
+
+impl RenderCtx<GpuTile> for WgpuRenderCtx {
+    fn upload_tile(&self, data: &[u8], width: u32, height: u32) -> GpuTile {
+        WgpuRenderCtx::upload_tile(self, data, width, height)
     }
 }
 
@@ -68,8 +76,8 @@ pub struct WgpuRenderer {
 }
 
 impl WgpuRenderer {
-    pub fn ctx(&self) -> RenderCtx {
-        RenderCtx {
+    pub fn ctx(&self) -> WgpuRenderCtx {
+        WgpuRenderCtx {
             device: self.device.clone(),
             queue: self.queue.clone(),
             tile_bgl: self.tile_bgl.clone(),

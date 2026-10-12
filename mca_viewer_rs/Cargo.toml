@@ -5,7 +5,7 @@ edition = "2024"
 default-run = "mca_viewer_rs"
 
 [features]
-cautious_unsafe = []
+cautious_unsafe = ["mca_tools/cautious_unsafe"]
 
 [[bin]]
 name = "sim"
@@ -24,20 +24,21 @@ slint = {version = "~1.18", default-features = false, features = [
 
 vello = {version = "~0.11", default-features = false, features = ["wgpu"]}
 parley = "0.12"
-serde = "1"
 bytemuck = {version = "1.25", features = ["derive"]}
+serde = "1"
 clap = {version = "4.6", features = ["derive"]}
-image = {version = "0.25", default-features = false}
-anyhow = "1"
-libdeflater = {version = "1.25", features = ["freestanding"]}
 toml = "1.1"
-crossbeam-channel = "0.5"
+image = {version = "0.25", default-features = false}
 rustc-hash = "2.1.2"
-hashbrown = "0.17.1"
-rand = "0.10.1"
-static_assertions = "1"
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
 parking_lot = "0.12.5"
+static_assertions = "1"
+anyhow = "1"
 thiserror = "2"
+
+[dev-dependencies]
+rand = "0.10.1"
 
 [build-dependencies]
 slint-build = "1.18"

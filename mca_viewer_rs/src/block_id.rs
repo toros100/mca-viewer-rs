@@ -1,7 +1,8 @@
 use static_assertions::{const_assert, const_assert_eq};
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash)]
+#[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash)]
 #[repr(transparent)]
+/// default block id is BlockId::INVALID
 pub struct BlockId(u16);
 
 // invariants

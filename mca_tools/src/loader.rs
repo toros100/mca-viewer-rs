@@ -16,16 +16,43 @@ impl Default for McaLoader {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum McaError {
+    #[error("invalid header")]
+    InvalidHeader,
+
+    #[error("unexpected EOF")]
+    UnexpectedEof,
+
+    #[error("chunk not found")]
+    ChunkNotFound,
+
+    #[error("unexpected compression type")]
+    UnexpectedCompression,
+
+    #[error("bad data")]
+    BadData,
+
+    #[error("invalid header: {:?}", .0)]
+    DecompressionError(#[from] libdeflater::DecompressionError),
+
+    #[error("Io error: {:?}", .0)]
+    IoError(#[from] std::io::Error),
+}
+
 impl McaLoader {
-    pub fn load_mca<R: std::io::Read>(&mut self, mut read: R) -> anyhow::Result<()> {
+    pub fn load_mca<R: std::io::Read>(&mut self, mut read: R) -> Result<(), McaError> {
         self.data.clear();
         let n = read.read_to_end(&mut self.data)?;
         if n < 8192 {
-            anyhow::bail!("invalid header (too short)")
+            return Err(McaError::InvalidHeader);
         }
         Ok(())
     }
-    fn get_chunk_pos(&self, idx: usize) -> anyhow::Result<(u32, u8)> {
+    pub fn raw_bytes(&self) -> &[u8] {
+        &self.data
+    }
+    fn get_chunk_pos(&self, idx: usize) -> Result<(u32, u8), McaError> {
         if self.data.is_empty() {
             panic!("no data loaded")
         }
@@ -34,7 +61,7 @@ impl McaLoader {
         }
 
         if self.data.len() < idx * 4 + 4 {
-            anyhow::bail!("unexpected EOF")
+            return Err(McaError::UnexpectedEof);
         }
 
         let v = u32::from_be_bytes([
@@ -47,17 +74,17 @@ impl McaLoader {
         let len = (v & 0xff) as u8;
         Ok((off, len))
     }
-    pub fn get_chunk_data(&mut self, idx: usize) -> anyhow::Result<&[u8]> {
+    pub fn get_chunk_data(&mut self, idx: usize) -> Result<&[u8], McaError> {
         let (off, len) = self.get_chunk_pos(idx)?;
 
         if off < 2 || len == 0 {
-            anyhow::bail!("chunk not found")
+            return Err(McaError::ChunkNotFound);
         }
 
         let o = off as usize;
 
         if self.data.len() < o * 4096 + 5 {
-            anyhow::bail!("unexpected EOF")
+            return Err(McaError::UnexpectedEof);
         }
 
         let bytes_len = i32::from_be_bytes([
@@ -68,19 +95,19 @@ impl McaLoader {
         ]);
 
         if bytes_len <= 1 {
-            anyhow::bail!("bad data")
+            return Err(McaError::BadData);
         }
 
         if self.data[o * 4096 + 4] != 2 {
             // 2 is zlib compression
-            anyhow::bail!("unexpected compression type")
+            return Err(McaError::UnexpectedCompression);
         }
 
         let chunk_byte_off = o * 4096 + 5;
         let chunk_byte_len = (bytes_len - 1) as usize;
 
         if self.data.len() < chunk_byte_off + chunk_byte_len {
-            anyhow::bail!("unexpected EOF")
+            return Err(McaError::UnexpectedEof);
         }
 
         let n = loop {
@@ -93,14 +120,12 @@ impl McaLoader {
                     self.decompressed_chunk
                         .resize(self.decompressed_chunk.len() * 2 + 1, 0);
                 }
-                Err(e) => {
-                    anyhow::bail!(e)
-                }
+                Err(e) => return Err(e.into()),
             }
         };
 
         if n <= 1 {
-            anyhow::bail!("bad data")
+            return Err(McaError::BadData);
             // could have a stronger bound here, but I just need this to be able to safely access
             // index 0 of the decompressed data and to subtract 1 from n
         }
@@ -109,7 +134,7 @@ impl McaLoader {
             // extra defensive check:
             // first byte should always be 10 (compound tag byte of the root compound tag)
             // last byte should always be 0 (end tag byte closing the root compound tag)
-            anyhow::bail!("bad data")
+            return Err(McaError::BadData);
         }
 
         Ok(&self.decompressed_chunk[..n])

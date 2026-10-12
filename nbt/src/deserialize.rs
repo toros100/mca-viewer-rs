@@ -1,5 +1,7 @@
 use std::{default, marker::PhantomData};
 
+use arrayvec::ArrayVec;
+
 use crate::{
     DeserializationError, DeserializationResult, Optional, RawString, Tag, deserialize_nbt_str,
     deserialize_nbt_str_bytes, read_i32_len,
@@ -49,17 +51,63 @@ impl<'d, T: DeserializePayload<'d> + Default> DeserializePayload<'d> for Vec<T> 
         let mut off = 1;
 
         if t != T::TAG {
-            return Err(DeserializationError::UnexpectedTag(t as u8));
+            return Err(DeserializationError::UnexpectedTag {
+                expected: T::TAG,
+                found: t,
+            });
         }
 
         let len = read_i32_len(&data[off..])?;
         off += 4;
 
-        self.resize_with(len, T::default);
+        self.clear();
+        self.reserve(len);
 
-        for v in self.iter_mut() {
-            off += v.deserialize_payload(&data[off..])?;
+        for _ in 0..len {
+            off += self
+                .push_mut(T::default())
+                .deserialize_payload(&data[off..])?;
         }
+        Ok(off)
+    }
+}
+
+impl<'d, const N: usize, T: DeserializePayload<'d> + Default> DeserializePayload<'d>
+    for ArrayVec<T, N>
+{
+    const TAG: Tag = Tag::List;
+
+    fn deserialize_payload(&mut self, data: &'d [u8]) -> DeserializationResult<usize> {
+        if data.len() < 5 {
+            return Err(DeserializationError::EOF);
+        };
+
+        let t = Tag::try_from(data[0])?;
+        let mut off = 1;
+
+        if t != T::TAG {
+            return Err(DeserializationError::UnexpectedTag {
+                expected: T::TAG,
+                found: t,
+            });
+        }
+
+        let len = read_i32_len(&data[off..])?;
+        if len > N {
+            return Err(DeserializationError::Custom(
+                "list length exceeded ArrayVec capacity".into(),
+            ));
+        }
+        off += 4;
+
+        self.clear();
+
+        for _ in 0..len {
+            self.push(T::default());
+            off +=
+                unsafe { self.last_mut().unwrap_unchecked() }.deserialize_payload(&data[off..])?;
+        }
+
         Ok(off)
     }
 }

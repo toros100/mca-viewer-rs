@@ -10,7 +10,6 @@ lto = "fat"
 [profile.prof]
 inherits = "release"
 debug = true
-strip = false
 
 [workspace.lints.clippy]
 large_types_passed_by_value = "warn"

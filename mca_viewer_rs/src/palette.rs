@@ -46,6 +46,10 @@ pub struct BlockPalette {
 }
 
 impl BlockPalette {
+    pub fn has_color(&self, id: BlockId) -> bool {
+        id != BlockId::INVALID && id < self.interner.static_interner.max_exclusive
+    }
+
     pub fn iter_entries(&self) -> impl Iterator<Item = (BlockId, &'static [u8], [u8; 4])> {
         self.palette.iter().map(|(id, col)| {
             let bs = *self.interner.static_interner.id_to_bytes.get(&id).unwrap();
@@ -130,12 +134,10 @@ impl VecPalette {
         }
     }
     pub fn get(&self, id: BlockId) -> [u8; 4] {
-        // NOTE: this abuses the internals of StaticId
-        // WARN: assumes the palette was built "for" the particular BlockInterner
         match id {
             BlockId::INVALID => self.default_col,
             id if let x = usize::from(id)
-                && x < self.static_palette.len() =>
+                && x <= self.static_palette.len() =>
             {
                 self.static_palette[x - 1]
             }
@@ -255,7 +257,7 @@ impl Interner<Dynamic> {
 
 pub struct BlockInterner {
     pub static_interner: Interner<Static>,
-    pub dyn_interner: parking_lot::RwLock<Interner<Dynamic>>,
+    pub dyn_interner: crossbeam_utils::CachePadded<parking_lot::RwLock<Interner<Dynamic>>>,
 }
 
 impl BlockInterner {
@@ -273,7 +275,7 @@ impl BlockInterner {
         let d = Interner::new(&static_interner);
         Self {
             static_interner,
-            dyn_interner: parking_lot::RwLock::new(d),
+            dyn_interner: crossbeam_utils::CachePadded::new(parking_lot::RwLock::new(d)),
         }
     }
 
@@ -284,7 +286,7 @@ impl BlockInterner {
 
         Self {
             static_interner: st,
-            dyn_interner: parking_lot::RwLock::new(dy),
+            dyn_interner: crossbeam_utils::CachePadded::new(parking_lot::RwLock::new(dy)),
         }
     }
 
@@ -292,6 +294,13 @@ impl BlockInterner {
         if let Some(i) = self.static_interner.get_id(bs) {
             return i;
         };
+
+        {
+            let r = self.dyn_interner.read();
+            if let Some(id) = r.get_id(bs) {
+                return id;
+            }
+        }
 
         let mut w = self.dyn_interner.write();
         w.get_or_intern(bs)

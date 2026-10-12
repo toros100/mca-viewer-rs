@@ -188,9 +188,9 @@ checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
 
 [[package]]
 name = "arrayvec"
-version = "0.7.6"
+version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "ash"
@@ -1651,8 +1651,6 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
- "allocator-api2",
- "equivalent",
  "foldhash 0.2.0",
 ]
 
@@ -2681,6 +2679,7 @@ dependencies = [
  "bytemuck",
  "libdeflater",
  "nbt",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2691,9 +2690,8 @@ dependencies = [
  "bytemuck",
  "clap",
  "crossbeam-channel",
- "hashbrown 0.17.1",
+ "crossbeam-utils",
  "image",
- "libdeflater",
  "mca_tools",
  "nbt",
  "parking_lot",
@@ -2838,6 +2836,7 @@ checksum = "308d96db8debc727c3fd9744aac51751243420e46edf401010908da7f8d5e57c"
 name = "nbt"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "nbt_derive",
  "rand",
  "thiserror 2.0.18",

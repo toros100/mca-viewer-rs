@@ -77,10 +77,15 @@ component HRule {
     }
 }
 
+export struct BlockAtCursor {
+    name: string,
+    has_color: bool,
+}
+
 export component MainWindow inherits Window {
 
     in property <WorldPosition> world_position;
-    in property <string> block_at_cursor;
+    in property <BlockAtCursor> block_at_cursor;
     in-out property <RenderOptions> render_options;
 
     in property <[PaletteEntry]> palette;
@@ -232,7 +237,7 @@ export component MainWindow inherits Window {
                     y: root.rcm_y;
                     PopupMenu {
                         PopupMenuHeading {
-                            text: root.block_at_cursor;
+                            text: root.block_at_cursor.name + (root.block_at_cursor.has-color ? "" : " (unmapped)");
                         }
 
                         HRule { }
@@ -263,7 +268,7 @@ export component MainWindow inherits Window {
 
                                 root.pointer_event(event.kind, event.button, event.modifiers, self.mouse_x / 1px, self.mouse_y / 1px, );
                                 if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
-                                    root.show_rcm(root.block_at_cursor, self.mouse_x, self.mouse-y);
+                                    root.show_rcm(root.block_at_cursor.name, self.mouse_x, self.mouse-y);
                                 }
                             }
                             scroll-event(event) => {
@@ -289,9 +294,10 @@ export component MainWindow inherits Window {
             padding: 4px;
             height: 24px;
             vertical-stretch: 0;
-            if (root.block_at_cursor != ""):
+            if (root.block_at_cursor.name != ""):
             Text {
-                text: root.block_at_cursor;
+                vertical-alignment: TextVerticalAlignment.center;
+                text: root.block_at_cursor.name;
             }
             Rectangle { }
 

@@ -8,7 +8,7 @@ pub const fn bits_required(n: usize) -> usize {
     (usize::BITS - (n - 1).leading_zeros()) as usize
 }
 
-#[inline(always)]
+#[inline]
 pub fn unpack_from_u64_bytes_dispatch(bs: &[u8], bit_width: usize, idx: usize) -> u16 {
     debug_assert!((4..=12).contains(&bit_width));
     match bit_width {
@@ -25,7 +25,7 @@ pub fn unpack_from_u64_bytes_dispatch(bs: &[u8], bit_width: usize, idx: usize) -
     }
 }
 
-#[inline(always)]
+#[inline]
 pub fn unpack_from_u64_bytes_width_4(bs: &[u8], idx: usize) -> u16 {
     let k = (idx / 16) * 8 + 7 - (idx % 16) / 2;
 
@@ -46,7 +46,7 @@ pub fn unpack_from_u64_bytes_width_4(bs: &[u8], idx: usize) -> u16 {
     ((val >> shift) & 0x0f) as u16
 }
 
-#[inline(always)]
+#[inline]
 pub fn unpack_from_u64_bytes_width_8(bs: &[u8], idx: usize) -> u16 {
     let j = (idx / 8) * 8 + 7 - idx % 8;
 
@@ -60,7 +60,7 @@ pub fn unpack_from_u64_bytes_width_8(bs: &[u8], idx: usize) -> u16 {
     }
 }
 
-#[inline(always)]
+#[inline]
 pub fn unpack_from_u64_bytes_width_generic<const BIT_WIDTH: usize>(bs: &[u8], idx: usize) -> u16 {
     const {
         assert!(4 <= BIT_WIDTH && BIT_WIDTH <= 12);
@@ -134,7 +134,7 @@ impl ExactSizeIterator for PackedIter<'_> {
     }
 }
 
-#[inline(always)]
+#[inline]
 pub fn unpack_from_long_bytes(bs: &[u8], bit_width: usize, idx: usize) -> u16 {
     debug_assert!(bit_width > 0);
     debug_assert!(bit_width <= 12);
