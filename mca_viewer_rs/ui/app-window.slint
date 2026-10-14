@@ -1,33 +1,144 @@
-import { Button, ComboBox, ScrollView, ListView } from "std-widgets.slint";
+import {
+    Button,
+    ComboBox,
+    ScrollView,
+    ListView,
+    LineEdit,
+} from "std-widgets.slint";
 import {
     PopupMenu,
     PopupMenuButton,
     PopupMenuHeading,
 } from "popup_menu.slint";
 
+import { ColorPicker } from "color_picker.slint";
+
 export struct PaletteEntry {
     id: int,
     name: string,
     color: color,
+    is_dirty: bool,
+    is_mapped: bool,
+}
+
+export enum FilterGroup {
+    all,
+    mapped,
+    unmapped,
+}
+
+export enum FilterStatus {
+    any,
+    modified,
+    unmodified,
+}
+
+component DebouncedLineEdit inherits HorizontalLayout {
+    in-out property <string> text;
+    out property <bool> dirty: false;
+    callback commit(string);
+
+    function commit_internal() {
+        if (root.dirty) {
+            root.commit(line.text);
+            root.dirty = false;
+        }
+    }
+
+    debounce := Timer {
+        interval: 200ms;
+        running: root.dirty;
+        triggered => {
+            root.commit_internal()
+        }
+    }
+
+    line := LineEdit {
+        text <=> root.text;
+        edited => { root.dirty = true }
+        accepted => { root.commit_internal() }
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                self.clear-focus();
+                accept
+            } else {
+                reject
+            }
+        }
+
+        changed has-focus => {
+            if (!self.has-focus) {
+                root.commit_internal()
+            }
+        }
+    }
 }
 
 component PaletteRow inherits HorizontalLayout {
     in property <PaletteEntry> entry;
-    padding-top: 8px;
+    padding-top: 4px;
+    padding-bottom: 4px;
     padding-left: 8px;
+    callback reset_color();
+    callback edit_color();
+    alignment: start;
 
     spacing: 8px;
-    cross-axis-alignment: center;
-    Rectangle {
-        border-radius: 4px;
-        border-width: 1px;
-        border-color: black;
-        width: 22px;
-        height: 22px;
-        background: entry.color;
+    cross-axis-alignment: start;
+
+    m := ContextMenuArea {
+        Menu {
+            MenuItem {
+                title: "Edit color";
+                activated => {
+                    root.edit_color()
+                }
+            }
+
+            MenuItem {
+                title: "Undo";
+                enabled: entry.is-dirty;
+                activated => {
+                    root.reset_color()
+                }
+            }
+        }
+
+        HorizontalLayout {
+            alignment: start;
+            spacing: 8px;
+            cross-axis-alignment: center;
+
+            Rectangle {
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: black;
+                width: 22px;
+                height: 22px;
+                background: entry.color;
+
+                if (!entry.is-mapped && !entry.is_dirty): Text {
+                    text: "?";
+                    color: black;
+                }
+
+                TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => { edit_color() }
+                    pointer-event(event) => {
+                        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                            let x = round((parent.x + parent.width / 2) / 1phx) * 1phx;
+                            let y = round((parent.y + parent.height / 2) / 1phx) * 1phx;
+                            m.show({ x: x, y: y })
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Text {
+        vertical-alignment: TextVerticalAlignment.center;
         text: entry.name;
     }
 }
@@ -77,9 +188,55 @@ component HRule {
     }
 }
 
+
 export struct BlockAtCursor {
+    id: int,
     name: string,
     has_color: bool,
+    color: color,
+}
+
+
+component ColorEditor inherits Rectangle {
+    in-out property <color> initial_color;
+    callback dismiss();
+    callback cancel();
+    callback submit(c: color);
+
+    VerticalLayout {
+        spacing: 8px;
+        width: parent.width;
+        alignment: start;
+
+        cp := ColorPicker {
+            initial_color: root.initial_color;
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+
+            Button {
+                text: "Reset";
+                enabled: cp.current_color != initial_color;
+                clicked => { cp.set_color(initial_color) }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            Button {
+                text: "Cancel";
+                clicked => { dismiss() }
+            }
+
+            Button {
+                text: "Submit";
+                enabled: cp.current_color != initial_color;
+                clicked => { submit(cp.current_color) }
+            }
+        }
+    }
 }
 
 export component MainWindow inherits Window {
@@ -122,11 +279,28 @@ export component MainWindow inherits Window {
     callback set_render_options(RenderOptions);
 
     callback render();
-
     callback fix_palette();
+    callback set_color(id: int, c: color);
+    callback reset_color(id: int);
+
+    callback set_search_pattern(string);
+    callback set_filter_group(FilterGroup);
+    callback set_filter_status(FilterStatus);
+
+    callback reload_palette();
+
+    callback discard_palette();
+    callback apply_palette();
 
     in-out property <length> rcm_x;
     in-out property <length> rcm_y;
+
+    in-out property <bool> show_color_editor;
+    in-out property <length> color_editor_x;
+    in-out property <length> color_editor_y;
+    in-out property <string> color_editor_target;
+    in-out property <int> color_editor_target_id;
+    in-out property <color> color_editor_color;
 
     function show_rcm(block: string, mouse_x: length, mouse_y: length) {
         if (block == "") {
@@ -148,20 +322,20 @@ export component MainWindow inherits Window {
     in-out property <image> canvas_image;
 
     in-out property <length> palette_sidebar_width: 300px;
-    in-out property <bool> palette_sidebar_show: false;
+    in-out property <bool> show_palette_sidebar;
 
     forward-focus: foc;
 
     VerticalLayout {
         HorizontalLayout {
-            height: 30px;
+            height: 32px;
 
             Button {
                 checkable: true;
-                checked: root.palette_sidebar_show;
+                checked: root.show_palette_sidebar;
                 text: "show palette";
                 clicked => {
-                    root.palette_sidebar_show = !root.palette_sidebar_show
+                    root.show_palette_sidebar = !root.show_palette_sidebar
                 }
             }
 
@@ -190,24 +364,156 @@ export component MainWindow inherits Window {
                     root.render()
                 }
             }
-
-            Button {
-                text: "fix palette";
-                clicked => {
-                    root.fix_palette()
-                }
-            }
         }
 
         HorizontalLayout {
-            if (root.palette_sidebar_show): HorizontalLayout {
+
+            // keeping state outside of the conditional element so it persists on close/reopen
+            in-out property <bool> btn_filter_checked: false;
+            in-out property <int> filter_group_index: 0;
+            in-out property <int> filter_status_index: 0;
+            in-out property <string> filter_search_pattern: "";
+
+            if (root.show_palette_sidebar): HorizontalLayout {
 
                 side := Rectangle {
+                    clip: true;
                     width: root.palette_sidebar_width;
-                    ListView {
+                    VerticalLayout {
 
-                        for e in root.palette: PaletteRow {
-                            entry: e;
+                        HorizontalLayout {
+                            padding: 8px;
+                            spacing: 8px;
+                            alignment: start;
+
+                            btn_filter := Button {
+                                checkable: true;
+                                checked <=> btn_filter_checked;
+                                text: "Filter";
+                            }
+
+                            Button {
+                                text: "Refresh";
+                                clicked => { root.reload_palette() }
+                            }
+                        }
+
+                        if (btn_filter.checked): GridLayout {
+                            padding: 8px;
+                            spacing: 8px;
+
+                            Row {
+                                Text {
+                                    vertical-alignment: TextVerticalAlignment.center;
+                                    text: "Search:";
+                                }
+
+                                search := DebouncedLineEdit {
+                                    text <=> filter_search_pattern;
+                                    horizontal-stretch: 1;
+                                    commit(s) => {
+                                        filter_search_pattern = s;
+                                        root.set_search_pattern(s)
+                                    }
+                                }
+                            }
+
+                            Row {
+                                Text {
+                                    vertical-alignment: TextVerticalAlignment.center;
+                                    text: "Group:";
+                                }
+
+                                ComboBox {
+                                    model: ["All", "Mapped", "Unmapped"];
+                                    current-index <=> filter_group_index;
+                                    property <[FilterGroup]> idx_to_group: [FilterGroup.all, FilterGroup.mapped, FilterGroup.unmapped];
+                                    changed current-index => {
+                                        root.set_filter_group(idx_to_group[self.current-index])
+                                    }
+                                }
+                            }
+
+                            Row {
+                                Text {
+                                    vertical-alignment: TextVerticalAlignment.center;
+                                    text: "Status:";
+                                }
+
+                                ComboBox {
+                                    model: ["Any", "Modified", "Unmodified"];
+                                    current-index <=> filter_status_index;
+                                    property <[FilterStatus]> idx_to_group: [FilterStatus.any, FilterStatus.modified, FilterStatus.unmodified];
+                                    changed current-index => {
+                                        root.set_filter_status(idx_to_group[self.current-index])
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                alignment: end;
+                                colspan: 2;
+                                Button {
+                                    text: "Clear filters";
+                                    clicked => {
+                                        filter_group_index = 0;
+                                        filter_status_index = 0;
+                                        // comboboxes trigger callbacks via changed
+    
+                                        filter_search_pattern = "";
+                                        root.set_search_pattern("");
+                                    }
+                                }
+                            }
+                        }
+
+                        HRule {
+                            color: #333333;
+                        }
+
+                        ListView {
+
+                            for e in root.palette: Rectangle {
+                                // border-width: 1px;
+                                background: e.is-dirty ? #FFFFFF20 : transparent;
+
+                                PaletteRow {
+                                    entry: e;
+                                    edit_color => {
+                                        if (!root.show_color_editor) {
+                                            root.color_editor_x = 0;
+                                            root.color_editor_y = 0;
+                                            root.show_color_editor = true;
+                                        }
+                                        root.color_editor_target_id = e.id;
+                                        root.color_editor_target = e.name;
+                                        root.color_editor_color = e.color;
+                                        rcm.close();
+                                    }
+                                    reset_color => {
+                                        root.reset_color(e.id)
+                                    }
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding: 8px;
+                            spacing: 8px;
+
+                            Button {
+                                text: "Discard changes";
+                                clicked => { root.discard_palette() }
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+
+                            Button {
+                                text: "Apply changes";
+                                clicked => { root.apply_palette() }
+                            }
                         }
                     }
                 }
@@ -237,13 +543,35 @@ export component MainWindow inherits Window {
                     y: root.rcm_y;
                     PopupMenu {
                         PopupMenuHeading {
-                            text: root.block_at_cursor.name + (root.block_at_cursor.has-color ? "" : " (unmapped)");
+                            text: root.block_at_cursor.name;
                         }
 
                         HRule { }
 
                         PopupMenuHeading {
                             text: "x: \{root.world_position.block-x}, z: \{root.world_position.block-z}";
+                        }
+
+                        PopupMenuButton {
+                            label: "Edit color";
+
+                            // currently has bad UX: can't edit color if the block is not already in the static interner
+                            // would have to refresh palette first, this is probably too unclear
+                            enabled: root.block_at_cursor.has-color;
+                            clicked => {
+
+                                root.show_palette_sidebar = true;
+
+                                if (!root.show_color_editor) {
+                                    root.color_editor_x = root.rcm_x;
+                                    root.color_editor_y = root.rcm_y;
+                                    root.show_color_editor = true;
+                                }
+                                root.color_editor_target_id = root.block_at_cursor.id;
+                                root.color_editor_target = root.block_at_cursor.name;
+                                root.color_editor_color = root.block_at_cursor.color;
+                                rcm.close();
+                            }
                         }
                     }
                 }
@@ -258,7 +586,6 @@ export component MainWindow inherits Window {
                     }
 
                     Image {
-                        // horizontal-stretch: 1;
                         vertical-stretch: 1;
                         image-fit: ImageFit.preserve;
                         source: root.canvas_image;
@@ -287,18 +614,72 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
+
+                if root.show_color_editor: color_editor := Rectangle {
+                    width: self.preferred-width;
+                    height: self.preferred-height;
+                    x: round(clamp(root.color_editor_x, 0, canvas.width - self.width) / 1px) * 1px;
+                    y: round(clamp(root.color_editor_y, 0, canvas.height - self.height) / 1px) * 1px;
+                    clip: true;
+                    border-width: 1px;
+                    border-color: black;
+                    border-radius: 6px;
+                    background: #272727;
+                    drop-shadow-color: #00000055;
+                    drop-shadow-blur: 6px;
+
+                    TouchArea { }
+
+                    VerticalLayout {
+                        Rectangle {
+                            height: 8px;
+                            background: #454545;
+                            TouchArea {
+                                mouse-cursor: self.pressed ? MouseCursor.move : MouseCursor.grab;
+                                moved => {
+                                    root.color_editor_x = clamp(root.color_editor_x + self.mouse-x - self.pressed-x, 0, canvas.width - color_editor.width);
+                                    root.color_editor_y = clamp(root.color_editor_y + self.mouse-y - self.pressed-y, 0, canvas.height - color_editor.height);
+                                }
+                            }
+                        }
+
+                        VerticalLayout {
+                            padding: 16px;
+                            padding-top: 8px;
+                            spacing: 8px;
+
+                            Text {
+                                text: root.color_editor_target;
+                                font-size: 14pt;
+                                font-weight: FontWeight.semi-bold;
+                            }
+
+                            ColorEditor {
+                                initial_color: root.color_editor_color;
+                                dismiss => { root.show_color_editor = false; }
+                                submit(c) => {
+                                    root.color_editor_color = c;
+                                    root.set_color(root.color_editor_target_id, c)
+                                }
+                            }
+                        }
+                    }
+                }
             }
+        }
+
+        Rectangle {
+            height: 2px;
+            background: #333333;
         }
 
         HorizontalLayout {
             padding: 4px;
-            height: 24px;
-            vertical-stretch: 0;
-            if (root.block_at_cursor.name != ""):
             Text {
                 vertical-alignment: TextVerticalAlignment.center;
                 text: root.block_at_cursor.name;
             }
+
             Rectangle { }
 
             Text {

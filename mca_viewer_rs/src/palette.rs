@@ -46,29 +46,16 @@ pub struct BlockPalette {
 }
 
 impl BlockPalette {
-    pub fn has_color(&self, id: BlockId) -> bool {
-        id != BlockId::INVALID && id < self.interner.static_interner.max_exclusive
-    }
-
-    pub fn iter_entries(&self) -> impl Iterator<Item = (BlockId, &'static [u8], [u8; 4])> {
-        self.palette.iter().map(|(id, col)| {
-            let bs = *self.interner.static_interner.id_to_bytes.get(&id).unwrap();
-            (id, bs, col)
-        })
-    }
-
-    pub fn new(palette: TomlPalette, default_color: [u8; 4]) -> Self {
+    pub fn new(toml_palette: TomlPalette, default_color: [u8; 4]) -> Self {
         let mut int = Interner::<Static>::default();
 
-        let mut pal = Vec::new();
-        for (k, v) in palette.blocks {
-            _ = int.get_or_intern(&k);
-            pal.push(v);
+        let mut palette = VecPalette::new(default_color);
+        for (k, v) in toml_palette.blocks {
+            let id = int.get_or_intern(&k);
+            palette.set_color(id, v);
         }
 
         let block_interner = BlockInterner::new(int);
-
-        let palette = VecPalette::new(pal, default_color);
 
         BlockPalette {
             palette,
@@ -76,8 +63,42 @@ impl BlockPalette {
         }
     }
 
+    pub fn set_color(&mut self, id: BlockId, c: [u8; 4]) {
+        self.palette.set_color(id, c);
+    }
+
+    pub fn has_color(&self, id: BlockId) -> bool {
+        id != BlockId::INVALID && id < self.interner.static_interner.max_exclusive
+    }
+
+    // HACK:
+    pub fn iter_entries(&self) -> impl Iterator<Item = (BlockId, &'static [u8], [u8; 4], bool)> {
+        let default_col = self.palette.static_palette[0];
+        let mni = self.palette.max_known_id();
+
+        self.palette
+            .iter()
+            .filter_map(|(id, col, mapped)| {
+                let bs = *self.interner.static_interner.id_to_bytes.get(&id)?;
+                Some((id, bs, col, mapped))
+            })
+            .chain(self.interner.static_interner.id_to_bytes.iter().filter_map(
+                move |(&id, &name)| {
+                    if id > mni {
+                        Some((id, name, default_col, false))
+                    } else {
+                        None
+                    }
+                },
+            ))
+    }
+
     pub fn fix(&mut self) {
         self.interner.fix();
+    }
+
+    pub fn get_block_id(&self, bs: &[u8]) -> Option<BlockId> {
+        self.interner.get_block_id(bs)
     }
 
     pub fn deep_clone(&self) -> Self {
@@ -90,7 +111,7 @@ impl BlockPalette {
 
 impl PaletteCtx for BlockPalette {
     fn get_color(&self, id: BlockId) -> [u8; 4] {
-        self.palette.get(id)
+        self.palette.get_color(id)
     }
 
     fn get_or_intern_block_id(&self, block: &[u8]) -> BlockId {
@@ -116,33 +137,75 @@ impl<P: PaletteCtx> PaletteCtx for Arc<P> {
 
 #[derive(Clone)]
 pub struct VecPalette {
+    // static_palette and mapped should always have the same nonzero length
+    //
+    // static_palette[i] is the color for BlockId(i)
+    // mapped[i] is true iff the color for BlockId(i) is explicitly set
     static_palette: Vec<[u8; 4]>,
-    default_col: [u8; 4],
+    mapped: Vec<bool>,
 }
 
 impl VecPalette {
-    pub fn iter(&self) -> impl Iterator<Item = (BlockId, [u8; 4])> {
-        self.static_palette.iter().enumerate().map(|(i, c)| {
-            let id = ((i + 1) as u16).into();
-            (id, *c)
-        })
+    fn max_known_id(&self) -> BlockId {
+        assert!(!self.static_palette.is_empty());
+        ((self.static_palette.len() - 1) as u16).into()
     }
-    pub fn new(p: Vec<[u8; 4]>, default: [u8; 4]) -> Self {
+
+    pub fn len(&self) -> usize {
+        self.static_palette.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (BlockId, [u8; 4], bool)> {
+        self.static_palette
+            .iter()
+            .enumerate()
+            .zip(self.mapped.iter())
+            .skip(1)
+            .map(|((i, c), b)| {
+                let id = (i as u16).into();
+                (id, *c, *b)
+            })
+    }
+
+    fn set_color(&mut self, id: BlockId, c: [u8; 4]) {
+        if id == BlockId::INVALID {
+            // not meaningful
+            return;
+        }
+
+        let i = usize::from(id);
+
+        // id = BlockId(i) goes to index i
+        // -> need length i + 1
+
+        if self.static_palette.len() > i {
+            self.static_palette[i] = c;
+            self.mapped[i] = true;
+        } else {
+            let default_col = self.static_palette[0];
+
+            let d = (i + 1).saturating_sub(self.static_palette.len());
+            self.static_palette
+                .extend(std::iter::repeat_n(default_col, d));
+            self.mapped.extend(std::iter::repeat_n(false, d));
+
+            self.static_palette[i] = c;
+            self.mapped[i] = true;
+        }
+    }
+
+    pub fn new(default_color: [u8; 4]) -> Self {
         Self {
-            static_palette: p,
-            default_col: default,
+            mapped: vec![false], // entry for BlockId::INVALID, mapped[0] not really meaningful
+            static_palette: vec![default_color],
         }
     }
-    pub fn get(&self, id: BlockId) -> [u8; 4] {
-        match id {
-            BlockId::INVALID => self.default_col,
-            id if let x = usize::from(id)
-                && x <= self.static_palette.len() =>
-            {
-                self.static_palette[x - 1]
-            }
-            _ => self.default_col,
-        }
+
+    /// returns the color for a BlockId, default color if id > self.max_known_id()
+    pub fn get_color(&self, id: BlockId) -> [u8; 4] {
+        let i = usize::from(id);
+        let j = if i < self.static_palette.len() { i } else { 0 };
+        self.static_palette[j]
     }
 }
 
@@ -269,6 +332,13 @@ impl BlockInterner {
 
         let mut w = dyn_interner.write();
         static_interner.drain_from(w.deref_mut());
+    }
+
+    fn get_block_id(&self, bs: &[u8]) -> Option<BlockId> {
+        if let Some(s) = self.static_interner.get_id(bs) {
+            return Some(s);
+        };
+        self.dyn_interner.read().get_id(bs)
     }
 
     fn new(static_interner: Interner<Static>) -> Self {

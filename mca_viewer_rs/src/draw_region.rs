@@ -248,7 +248,7 @@ pub fn draw_region<P: PaletteCtx>(
                 if block_x == 0 {
                     height_cache.next_left_contour[block_z as usize] = h
                 }
-                if block_z == 0 && block_z == 15 {
+                if block_x == 0 && block_z == 15 {
                     height_cache.next_sw_corner[chunk_x] = h
                 }
             }
@@ -449,7 +449,7 @@ pub fn draw_slice<P: PaletteCtx>(
                 if block_x == 0 {
                     height_cache.next_left_contour[block_z as usize] = h
                 }
-                if block_z == 0 && block_z == 15 {
+                if block_x == 0 && block_z == 15 {
                     height_cache.next_sw_corner[chunk_x] = h
                 }
             }

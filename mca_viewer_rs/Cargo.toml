@@ -5,7 +5,7 @@ edition = "2024"
 default-run = "mca_viewer_rs"
 
 [features]
-cautious_unsafe = ["mca_tools/cautious_unsafe"]
+cautious_unsafe = []
 
 [[bin]]
 name = "sim"
@@ -22,6 +22,7 @@ slint = {version = "~1.18", default-features = false, features = [
 "live-preview",
 ]}
 
+nucleo-matcher = "0.3"
 vello = {version = "~0.11", default-features = false, features = ["wgpu"]}
 parley = "0.12"
 bytemuck = {version = "1.25", features = ["derive"]}

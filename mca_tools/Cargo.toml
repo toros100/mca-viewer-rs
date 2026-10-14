@@ -3,12 +3,6 @@ name = "mca_tools"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-cautious_unsafe = []
-
 [dependencies]
-nbt = {path = "../nbt/"}
-bytemuck = "1.25"
 libdeflater = "1.26.1"
-anyhow = "1"
 thiserror = "2"

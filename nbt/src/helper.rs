@@ -130,7 +130,7 @@ fn skip_list_payload(data: &[u8]) -> DeserializationResult<usize> {
 fn skip_compound_payload(data: &[u8]) -> DeserializationResult<usize> {
     let mut off = 0;
     loop {
-        if data.len() < off {
+        if data.len() <= off {
             return Err(DeserializationError::EOF);
         }
 

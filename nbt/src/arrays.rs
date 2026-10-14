@@ -21,6 +21,12 @@ fn deserialize_array_payload<'d, const ELEM_BYTE_SIZE: usize>(
 #[derive(Debug, Default, Clone)]
 pub struct ByteArrayBytes<'a>(&'a [u8]);
 
+impl<'a> ByteArrayBytes<'a> {
+    pub fn as_slice(&self) -> &'a [u8] {
+        self.0
+    }
+}
+
 impl<'d> DeserializePayload<'d> for ByteArrayBytes<'d> {
     const TAG: Tag = Tag::ByteArray;
 
@@ -41,6 +47,12 @@ impl<'d> std::ops::Deref for ByteArrayBytes<'d> {
 #[derive(Debug, Default, Clone)]
 pub struct IntArrayBytes<'a>(&'a [u8]);
 
+impl<'a> IntArrayBytes<'a> {
+    pub fn as_slice(&self) -> &'a [u8] {
+        self.0
+    }
+}
+
 impl<'d> DeserializePayload<'d> for IntArrayBytes<'d> {
     const TAG: Tag = Tag::IntArray;
 
@@ -60,6 +72,12 @@ impl<'d> std::ops::Deref for IntArrayBytes<'d> {
 
 #[derive(Debug, Default, Clone)]
 pub struct LongArrayBytes<'a>(&'a [u8]);
+
+impl<'a> LongArrayBytes<'a> {
+    pub fn as_slice(&self) -> &'a [u8] {
+        self.0
+    }
+}
 
 impl<'d> DeserializePayload<'d> for LongArrayBytes<'d> {
     const TAG: Tag = Tag::LongArray;

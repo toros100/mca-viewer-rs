@@ -2675,10 +2675,7 @@ dependencies = [
 name = "mca_tools"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "bytemuck",
  "libdeflater",
- "nbt",
  "thiserror 2.0.18",
 ]
 
@@ -2694,6 +2691,7 @@ dependencies = [
  "image",
  "mca_tools",
  "nbt",
+ "nucleo-matcher",
  "parking_lot",
  "parley 0.12.0",
  "rand",
@@ -2936,6 +2934,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42b8cfee0e339a0337359f3c88165702ac6e600dc01c0cc9579a92d62b08477a"
 dependencies = [
  "bitflags 2.12.1",
+]
+
+[[package]]
+name = "nucleo-matcher"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf33f538733d1a5a3494b836ba913207f14d9d4a1d3cd67030c5061bdd2cac85"
+dependencies = [
+ "memchr",
+ "unicode-segmentation",
 ]
 
 [[package]]

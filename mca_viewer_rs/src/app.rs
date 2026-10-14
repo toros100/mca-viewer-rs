@@ -2,8 +2,7 @@ mod slint_conv;
 mod slint_gen;
 
 use mca_viewer_rs::block_id::BlockId;
-use mca_viewer_rs::palette::BlockPalette;
-use slint::ModelExt;
+use mca_viewer_rs::palette::{BlockPalette, PaletteCtx};
 use slint::language::{KeyboardModifiers, PointerEventKind};
 use slint::platform::PointerEventButton;
 use slint::wgpu_30::wgpu;
@@ -15,7 +14,7 @@ use std::{cell::RefCell, collections::HashMap, error::Error, rc::Rc};
 use vello::kurbo;
 use vello::kurbo::Point;
 
-use slint::{ComponentHandle, ModelRc, SharedString, ToSharedString, VecModel, Weak};
+use slint::{ComponentHandle, ModelRc, SharedString, ToSharedString, Weak};
 
 use vello::kurbo::Affine;
 
@@ -28,7 +27,9 @@ use mca_viewer_rs::worker::{ManagerHandle, RegionTile, RenderMode, RenderOptions
 pub struct PaletteEntry {
     id: BlockId,
     name: SharedString,
-    col: slint::Color,
+    new_color: slint::Color,
+    color: slint::Color,
+    is_mapped: bool,
 }
 
 #[derive(Clone)]
@@ -89,9 +90,55 @@ pub fn new(num_workers: NonZeroUsize, palette: Arc<BlockPalette>) -> anyhow::Res
     let app = App::new(&window, num_workers, palette);
 
     app.borrow().register_callbacks()?;
-    app.borrow_mut().refresh_palette_model();
 
     Ok(AppHandle { app, window })
+}
+
+#[derive(Default)]
+struct BlockFilter {
+    group: slint_gen::FilterGroup,
+    status: slint_gen::FilterStatus,
+    matcher: nucleo_matcher::Matcher,
+    pattern: nucleo_matcher::pattern::Pattern,
+    scratch: Vec<char>,
+}
+
+impl BlockFilter {
+    fn set_pattern(&mut self, p: &str) {
+        self.pattern = nucleo_matcher::pattern::Pattern::new(
+            p,
+            nucleo_matcher::pattern::CaseMatching::Ignore,
+            nucleo_matcher::pattern::Normalization::Never,
+            nucleo_matcher::pattern::AtomKind::Fuzzy,
+        );
+    }
+
+    fn set_filter_group(&mut self, f: slint_gen::FilterGroup) {
+        self.group = f;
+    }
+
+    fn set_filter_status(&mut self, s: slint_gen::FilterStatus) {
+        self.status = s;
+    }
+
+    fn score(&mut self, e: &PaletteEntry) -> Option<u32> {
+        match self.group {
+            slint_gen::FilterGroup::Unmapped if e.is_mapped => return None,
+            slint_gen::FilterGroup::Mapped if !e.is_mapped => return None,
+            _ => {}
+        }
+
+        match self.status {
+            slint_gen::FilterStatus::Modified if e.color == e.new_color => return None,
+            slint_gen::FilterStatus::Unmodified if e.color != e.new_color => return None,
+            _ => {}
+        }
+
+        self.pattern.score(
+            nucleo_matcher::Utf32Str::new(&e.name, &mut self.scratch),
+            &mut self.matcher,
+        )
+    }
 }
 
 pub struct App {
@@ -115,7 +162,117 @@ pub struct App {
     min_scale_pow: i8,
     curr_scale_pow: i8,
     max_scale_pow: i8,
-    pal_model_internal: Rc<VecModel<PaletteEntry>>,
+    palette_model: Rc<PaletteModel>,
+}
+
+#[derive(Default)]
+struct PaletteModelInner {
+    filter: BlockFilter,
+    entries: Vec<PaletteEntry>,
+    indices: Vec<EntryRef>,
+}
+
+#[derive(Default)]
+struct PaletteModel {
+    inner: RefCell<PaletteModelInner>,
+
+    // TODO: currently just calling notify.reset() on any change, could do dirty tracking
+    notify: slint::ModelNotify,
+}
+
+struct EntryRef {
+    idx: usize,
+    score: u32,
+}
+
+impl PaletteModelInner {
+    fn load(&mut self, it: impl Iterator<Item = PaletteEntry>) {
+        let n = self.entries.len();
+        for entry in it {
+            if self.entries[..n]
+                .binary_search_by_key(&entry.id, |e| e.id)
+                .is_err()
+            {
+                self.entries.push(entry)
+            }
+        }
+        self.entries.sort_by_key(|e| e.id);
+        self.rescore();
+    }
+
+    fn discard_changes(&mut self) {
+        for entry in self.entries.iter_mut() {
+            entry.new_color = entry.color
+        }
+        self.rescore();
+    }
+
+    fn set_color(&mut self, id: BlockId, col: slint::Color) {
+        if let Ok(idx) = self.entries.binary_search_by_key(&id, |e| e.id) {
+            self.entries[idx].new_color = col;
+        }
+        self.rescore();
+    }
+
+    fn reset_color(&mut self, id: BlockId) {
+        if let Ok(idx) = self.entries.binary_search_by_key(&id, |e| e.id) {
+            self.entries[idx].new_color = self.entries[idx].color;
+        }
+        self.rescore();
+    }
+
+    fn set_pattern(&mut self, s: &str) {
+        self.filter.set_pattern(s);
+        self.rescore();
+    }
+
+    fn set_filter_group(&mut self, g: slint_gen::FilterGroup) {
+        self.filter.set_filter_group(g);
+        self.rescore();
+    }
+
+    fn set_filter_status(&mut self, s: slint_gen::FilterStatus) {
+        self.filter.set_filter_status(s);
+        self.rescore();
+    }
+
+    fn rescore(&mut self) {
+        self.indices.clear();
+        for (idx, e) in self.entries.iter_mut().enumerate() {
+            let score = self.filter.score(e);
+            if let Some(score) = score {
+                self.indices.push(EntryRef { idx, score })
+            }
+        }
+
+        self.indices
+            .sort_by(|r1, r2| r2.score.cmp(&r1.score).then(r2.idx.cmp(&r1.idx)));
+    }
+}
+
+impl slint::Model for PaletteModel {
+    type Data = slint_gen::PaletteEntry;
+    fn row_count(&self) -> usize {
+        self.inner.borrow().indices.len()
+    }
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        let inner = self.inner.borrow();
+        inner.indices.get(row).map(|i| {
+            let e = &inner.entries[i.idx];
+
+            slint_gen::PaletteEntry {
+                color: e.new_color,
+                id: (u16::from(e.id) as i32),
+                name: e.name.clone(),
+                is_dirty: e.new_color != e.color,
+                is_mapped: e.is_mapped,
+            }
+        })
+    }
+
+    fn model_tracker(&self) -> &dyn slint::ModelTracker {
+        &self.notify
+    }
 }
 
 impl App {
@@ -125,7 +282,7 @@ impl App {
         palette: Arc<BlockPalette>,
     ) -> Rc<RefCell<Self>> {
         let notify = NotifyApp::new(window.as_weak());
-        Rc::new_cyclic(|e| {
+        let app = Rc::new_cyclic(|e| {
             RefCell::new(Self {
                 palette,
                 self_ref: e.clone(),
@@ -147,54 +304,39 @@ impl App {
                 min_scale_pow: -4,
                 max_scale_pow: 8,
                 curr_scale_pow: 0,
-                pal_model_internal: Default::default(),
+                palette_model: Default::default(),
             })
-        })
+        });
+        app.borrow_mut().load_palette_model();
+        app
     }
-    fn refresh_palette_model(&mut self) {
-        self.pal_model_internal.clear();
-        self.pal_model_internal
-            .extend(
+    fn load_palette_model(&mut self) {
+        self.palette_model
+            .inner
+            .borrow_mut()
+            .load(
                 self.palette
                     .iter_entries()
-                    .map(|(id, name, col)| PaletteEntry {
-                        id,
-                        name: String::from_utf8_lossy(name).to_shared_string(),
-                        col: slint::Color::from_rgb_u8(col[0], col[1], col[2]),
+                    .map(|(id, name, col, is_mapped)| {
+                        let color = slint::Color::from_rgb_u8(col[0], col[1], col[2]);
+                        // HACK: not nice
+                        PaletteEntry {
+                            id,
+                            name: String::from_utf8_lossy(name).to_shared_string(),
+                            color,
+                            new_color: color,
+                            is_mapped,
+                        }
                     }),
             );
-
-        let m: ModelRc<PaletteEntry> = ModelRc::new(self.pal_model_internal.clone());
-
-        let Some(w) = self.window.upgrade() else {
-            return;
-        };
-        w.set_palette(ModelRc::new(m.map(|e| slint_gen::PaletteEntry {
-            id: usize::from(e.id) as i32,
-            name: e.name,
-            color: e.col,
-        })));
     }
 
     fn fix_palette(&mut self) {
         let mut pal = self.palette.deep_clone();
         pal.fix();
         self.palette = Arc::new(pal);
-        self.refresh_palette_model();
-        self.rerender();
-    }
-
-    fn dump_dyn_palette(&self) {
-        let pal = self.palette.deep_clone();
-
-        let dy = pal.interner.dyn_interner.read();
-
-        let n = dy.bytes_to_id.len();
-        println!("--- {n} entries ---");
-        for (id, bs) in dy.id_to_bytes.iter() {
-            let bs = String::from_utf8_lossy(bs);
-            println!("[{id:?}] {bs}")
-        }
+        self.load_palette_model();
+        self.rerender(false);
     }
 
     pub fn update_render_options(&mut self, opt: RenderOptions) {
@@ -279,15 +421,29 @@ impl App {
 
             let has_color = self.palette.has_color(id);
 
+            let color = self.palette.get_color(id);
+
+            let c = slint::Color::from_rgb_u8(color[0], color[1], color[2]);
+
             if let Some(bytes) = bs {
                 // could maybe keep these shared strings around to avoid re-allocating them each
                 // time, but it probably doesnt matter at all
                 let name = String::from_utf8_lossy(bytes).to_shared_string();
-                window.set_block_at_cursor(slint_gen::BlockAtCursor { name, has_color });
+
+                let id = usize::from(id) as i32;
+
+                window.set_block_at_cursor(slint_gen::BlockAtCursor {
+                    name,
+                    has_color,
+                    color: c,
+                    id,
+                });
             } else {
                 window.set_block_at_cursor(slint_gen::BlockAtCursor {
                     name: "".into(),
                     has_color: false,
+                    color: c,
+                    id: 0,
                 });
             }
         }
@@ -525,10 +681,12 @@ impl App {
         }
     }
 
-    fn rerender(&mut self) {
+    fn rerender(&mut self, bump_id: bool) {
         println!("rendering {} regions", self.regions.len());
-        self.tiles.clear();
-        self.send_task(true);
+        if bump_id {
+            self.tiles.clear();
+        }
+        self.send_task(bump_id);
     }
 
     fn increase_scale(&mut self, fixed_screen_point: Point) {
@@ -601,7 +759,7 @@ impl App {
         window.on_render({
             let app = app.clone();
             move || {
-                app.borrow_mut().rerender();
+                app.borrow_mut().rerender(true);
             }
         });
 
@@ -674,6 +832,137 @@ impl App {
                 if let Some(w) = window.upgrade() {
                     w.window().request_redraw();
                 }
+            }
+        });
+
+        window.on_set_color({
+            let app = app.clone();
+            move |id, c| {
+                // TODO: kind of annoying to deep clone the palette for every single color change
+                //
+                // could batch changes first, e.g. have a working copy (already have a slint
+                // model), changes are written to that, and then separately committed to the real
+                // palette with a single deep clone
+
+                let id = if id <= 1 || id >= u16::MAX as i32 {
+                    return;
+                } else {
+                    BlockId::from(id as u16)
+                };
+
+                let app = app.borrow_mut();
+
+                app.palette_model.inner.borrow_mut().set_color(id, c);
+                app.palette_model.notify.reset();
+            }
+        });
+
+        window.on_apply_palette({
+            let app = app.clone();
+            move || {
+                let new_palette = {
+                    let app = app.borrow();
+                    let mut p = app.palette.deep_clone();
+                    let mut pp = app.palette_model.inner.borrow_mut();
+                    for e in pp.entries.iter_mut() {
+                        if e.color != e.new_color {
+                            let c = [
+                                e.new_color.red(),
+                                e.new_color.green(),
+                                e.new_color.blue(),
+                                255,
+                            ];
+                            p.set_color(e.id, c);
+                            e.color = e.new_color;
+                            e.is_mapped = true;
+                        }
+                    }
+                    p.fix();
+                    p
+                };
+                app.borrow_mut().palette = Arc::new(new_palette);
+                app.borrow_mut().rerender(false);
+                app.borrow().palette_model.notify.reset();
+            }
+        });
+
+        window.on_reset_color({
+            let app = app.clone();
+            move |id| {
+                let id = if id <= 1 || id >= u16::MAX as i32 {
+                    return;
+                } else {
+                    BlockId::from(id as u16)
+                };
+
+                let app = app.borrow_mut();
+
+                app.palette_model.inner.borrow_mut().reset_color(id);
+                app.palette_model.notify.reset();
+            }
+        });
+
+        window.on_set_search_pattern({
+            let app = app.clone();
+            move |s| {
+                let app = app.borrow();
+                app.palette_model.inner.borrow_mut().set_pattern(&s);
+                app.palette_model.notify.reset();
+            }
+        });
+
+        window.on_reload_palette({
+            let app = app.clone();
+            move || {
+                app.borrow_mut().fix_palette();
+
+                let app = app.borrow();
+                app.palette_model
+                    .inner
+                    .borrow_mut()
+                    .load(app.palette.iter_entries().map(|(id, name, c, is_mapped)| {
+                        let color = slint::Color::from_rgb_u8(c[0], c[1], c[2]);
+                        let name = String::from_utf8_lossy(name).to_shared_string();
+                        PaletteEntry {
+                            id,
+                            name,
+                            new_color: color,
+                            color,
+                            is_mapped,
+                        }
+                    }));
+
+                app.palette_model.notify.reset();
+            }
+        });
+
+        window.set_palette(ModelRc::new(self.palette_model.clone()));
+
+        window.on_set_filter_group({
+            let app = app.clone();
+            move |f| {
+                let app = app.borrow();
+                app.palette_model.inner.borrow_mut().set_filter_group(f);
+
+                app.palette_model.notify.reset();
+            }
+        });
+
+        window.on_set_filter_status({
+            let app = app.clone();
+            move |s| {
+                let app = app.borrow();
+                app.palette_model.inner.borrow_mut().set_filter_status(s);
+                app.palette_model.notify.reset();
+            }
+        });
+
+        window.on_discard_palette({
+            let app = app.clone();
+            move || {
+                let app = app.borrow();
+                app.palette_model.inner.borrow_mut().discard_changes();
+                app.palette_model.notify.reset();
             }
         });
 

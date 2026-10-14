@@ -4,8 +4,8 @@ use nbt::{
     ConstBytes, DeserializationError, DeserializePayload, arrays::LongArrayBytes, read_i32_len,
 };
 
-use crate::{block_id::BlockId, cautious_unsafe, palette::PaletteCtx};
-use mca_tools::bitpack::{bits_required, unpack_from_u64_bytes_dispatch};
+use crate::{block_id::BlockId, palette::PaletteCtx};
+use mca_tools::bitpack::{PackedIndices, PackedIndicesError};
 
 #[derive(DeserializePayload)]
 pub struct Chunk<'a> {
@@ -24,6 +24,18 @@ pub struct Chunk<'a> {
 
     #[nbt(skip)]
     pub y_limit: u16,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DataError {
+    #[error("no sections found")]
+    NoSections,
+    #[error("unexpected sections layout")]
+    UnexpectedSectionsLayout,
+    #[error("empty palette")]
+    EmptyPalette,
+    #[error("packed indices error: {:?}", .0)]
+    PackedIndices(#[from] PackedIndicesError),
 }
 
 impl<'a> Chunk<'a> {
@@ -49,19 +61,31 @@ impl<'a> Chunk<'a> {
         }
     }
 
-    pub fn validate_and_init<P: PaletteCtx>(&mut self, p: &P) -> anyhow::Result<()> {
+    pub fn validate_and_init<P: PaletteCtx>(&mut self, p: &P) -> Result<(), DataError> {
         let (min_section_idx, max_section_idx) = self
             .sections
             .iter()
             .map(|s| (s.y, s.y))
             .reduce(|(a_1, b_1), (a_2, b_2)| (a_1.min(a_2), b_1.max(b_2)))
-            .ok_or(anyhow::anyhow!("no sections"))?;
+            .ok_or(DataError::NoSections)?;
 
         self.y_limit = 16 * ((max_section_idx - min_section_idx) as u16 + 1);
 
         for s in self.sections.iter_mut() {
             let l = s.block_states.palette.len();
-            s.block_states.bit_width = bits_required(l).clamp(4, 12);
+            if l == 0 {
+                return Err(DataError::EmptyPalette);
+            }
+
+            if l == 1 {
+                s.block_states.indices = SectionIndices::Zero;
+            } else {
+                let packed = PackedIndices::new(
+                    s.block_states.data.as_ref().map_or(&[], |b| b.as_slice()),
+                    l,
+                )?;
+                s.block_states.indices = SectionIndices::Packed(packed);
+            }
 
             s.block_states.cached_palette.clear();
             s.block_states.cached_palette_ok = false;
@@ -73,7 +97,7 @@ impl<'a> Chunk<'a> {
 
         for [s1, s2] in self.sections.array_windows::<2>() {
             if s1.y + 1 != s2.y {
-                anyhow::bail!("unexpected sections layout")
+                return Err(DataError::UnexpectedSectionsLayout);
             }
         }
 
@@ -307,8 +331,8 @@ impl<'a> BlockStates<'a> {
                 is_watery,
             })
         }
-
         self.cached_palette_ok = true;
+        debug_assert_eq!(self.cached_palette.len(), self.palette.len());
     }
 
     pub fn non_airy_at_or_below<P: PaletteCtx>(
@@ -377,32 +401,22 @@ impl<'a> BlockStates<'a> {
     /// must have idx < 4096
     #[inline]
     pub fn get_block<P: PaletteCtx>(&mut self, idx: u16, p: &P) -> Option<BlockInfo> {
-        if cautious_unsafe!() {
-            assert!(idx < 4096)
-        } else {
-            debug_assert!(idx < 4096);
-        }
+        debug_assert!(idx < 4096);
 
         if !self.cached_palette_ok {
             self.cache_palette(p);
         }
 
-        match self.palette.len() {
-            0 => None,
-            1 => Some(self.cached_palette[0]),
-            _ => match self.data {
-                Some(ref d) => {
-                    let pal_idx =
-                        unpack_from_u64_bytes_dispatch(d, self.bit_width, idx as usize) as usize;
-                    if pal_idx > self.palette.len() {
-                        None
-                    } else {
-                        Some(self.cached_palette[pal_idx])
-                    }
-                }
-                None => None,
-            },
-        }
+        // if self.indices is SectionIndices::Packed(p), then p was made for self.palette.len()
+        // so the lengths need to match
+        debug_assert_eq!(self.palette.len(), self.cached_palette.len());
+
+        Some(match &self.indices {
+            // could store self.cached_palette[0] directly in the Zero variant, but i don't really
+            // like that
+            SectionIndices::Zero => self.cached_palette[0],
+            SectionIndices::Packed(p) => self.cached_palette[p.get(idx as usize)?],
+        })
     }
 }
 
@@ -412,6 +426,11 @@ pub struct BlockInfo {
     pub color: [u8; 4],
     pub is_airy: bool,
     pub is_watery: bool,
+}
+
+pub enum SectionIndices<'a> {
+    Zero,
+    Packed(PackedIndices<'a>),
 }
 
 #[derive(DeserializePayload)]
@@ -432,6 +451,9 @@ pub struct BlockStates<'a> {
 
     #[nbt(optional)]
     data: Option<LongArrayBytes<'a>>,
+
+    #[nbt(skip)]
+    indices: SectionIndices<'a>,
 
     #[nbt(skip)]
     bit_width: usize,
@@ -577,6 +599,7 @@ impl<'d> nbt::DeserializePayload<'d> for Palette<'d> {
 impl BlockStates<'_> {
     fn sanitize(&mut self) {
         self.palette.clear();
+        self.indices = SectionIndices::Zero;
         self.data = None;
         self.bit_width = 0;
     }
@@ -590,6 +613,7 @@ impl Default for BlockStates<'_> {
             data: None,
             bit_width: 0,
             cached_palette_ok: false,
+            indices: SectionIndices::Zero,
             all_airy: true,
             all_watery: true,
         }

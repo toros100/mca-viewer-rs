@@ -1,0 +1,131 @@
+export component ColorPicker inherits GridLayout {
+
+    in-out property <color> initial_color;
+    in-out property <float> hue: initial_color.to-hsv().hue;
+    in-out property <float> saturation: initial_color.to-hsv().saturation;
+    in-out property <float> value: initial_color.to-hsv().value;
+    in-out property <color> current_color: Colors.hsv(hue, saturation, value);
+
+    changed initial_color => {
+        let h = initial_color.to-hsv();
+        hue = h.hue;
+        saturation = h.saturation;
+        value = h.value;
+    }
+
+    public function set_color(c: color) {
+        let hsv = c.to-hsv();
+        initial_color = c;
+        hue = hsv.hue;
+        saturation = hsv.saturation;
+        value = hsv.value;
+    }
+
+    Row {
+
+        Rectangle {
+            width: 150px;
+            height: 150px;
+            background: current_color;
+        }
+
+        Rectangle {
+            width: 225px;
+            // height: 150px;
+
+            background: Colors.hsv(hue, 1, 1);
+
+            Rectangle {
+                background: @linear-gradient(90deg, #ffffffff, #ffffff00);
+            }
+
+            Rectangle {
+                background: @linear-gradient(180deg, #00000000, #000000ff);
+            }
+
+            Rectangle {
+                width: 16px;
+                height: 16px;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: white;
+                drop-shadow-color: gray;
+                drop-shadow-blur: 2px;
+                background: current_color;
+                x: saturation * parent.width - self.width / 2;
+                y: (1 - value) * parent.height - self.height / 2;
+            }
+
+            touch := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+
+                function update() {
+                    saturation = clamp(self.mouse-x / self.width, 0, 1);
+                    value = 1 - clamp(self.mouse-y / self.height, 0, 1);
+                }
+
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.down) {
+                        update()
+                    }
+                }
+
+                moved => {
+                    update()
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        colspan: 2;
+        height: 28px;
+
+        Rectangle {
+            height: 12px;
+            border-radius: 2px;
+            background: @linear-gradient(90deg, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00);
+            Rectangle {
+                width: 12px;
+                height: 18px;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: white;
+                drop-shadow-color: gray;
+                drop-shadow-blur: 2px;
+                background: Colors.hsv(root.hue, 1, 1);
+                x: hue / 360 * parent.width - self.width / 2;
+                y: 0.5 * parent.height - self.height / 2;
+            }
+
+            touch2 := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+
+                function update() {
+                    hue = clamp(self.mouse-x / self.width, 0, 1) * 360;
+                }
+
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.down) {
+                        update()
+                    }
+                }
+
+                moved => {
+                    update()
+                }
+            }
+        }
+    }
+
+    Row {
+
+        Rectangle {
+            colspan: 2;
+
+            Text {
+                text: "RGB: \{current_color.red}, \{current_color.green}, \{current_color.blue}";
+            }
+        }
+    }
+}
