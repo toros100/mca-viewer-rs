@@ -92,7 +92,6 @@ pub trait DeserializeExt<'d>: DeserializePayload<'d> + Sized {
         let tag = Tag::try_from(data[0])?;
 
         if tag != Self::TAG {
-            eprintln!("wrong tag at root wtf");
             return Err(DeserializationError::UnexpectedTag {
                 expected: Self::TAG,
                 found: tag,
@@ -146,8 +145,9 @@ pub fn from_bytes<'d, T: DeserializePayload<'d> + Default>(
 pub trait Optional {
     /// will be called to set the value on an optional field, if no value was deserialized.
     fn handle_absent(&mut self);
-    /// will be called before during. the entire field (type tag, name and payload) will
-    /// only be serialized if is_present returns true.
+
+    /// will be called prior to serialization of a field. the fields name and payload will only be
+    /// serialized, if is_present returns true.
     fn is_present(&self) -> bool;
 }
 

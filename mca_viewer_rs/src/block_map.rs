@@ -1,9 +1,7 @@
 use crate::block_id::BlockId;
-use crate::palette::PaletteCtx;
 use crate::{cautious_unsafe, cfg_unreachable};
 use mca_tools::bitpack::bits_required;
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
 
 pub struct BlockMap(Box<[BlockId; 512 * 512]>);
 
@@ -34,8 +32,7 @@ impl DerefMut for BlockMap {
 
 /// storage of every (top) block in a region
 /// bit-packed due to RAM prices
-pub struct PackedBlockMap<P> {
-    palette: Arc<P>,
+pub struct PackedBlockMap {
     local_palette: Vec<BlockId>,
     bit_width: u64,
     u64_div_bit_width: usize,
@@ -43,7 +40,7 @@ pub struct PackedBlockMap<P> {
     packed: Vec<u64>,
 }
 
-impl<P: PaletteCtx> PackedBlockMap<P> {
+impl PackedBlockMap {
     pub fn byte_size(&self) -> usize {
         let struct_size = std::mem::size_of::<Self>();
 
@@ -60,14 +57,13 @@ impl<P: PaletteCtx> PackedBlockMap<P> {
         self.local_palette.len()
     }
 
-    pub fn new(cs: &[BlockId; 512 * 512], origin: Arc<P>) -> Self {
+    pub fn new(cs: &[BlockId; 512 * 512]) -> Self {
         let mapping = BlockIdMapping::new(cs);
 
         debug_assert!(!mapping.pal.is_empty());
 
         if mapping.pal.len() == 1 {
             Self {
-                palette: origin,
                 local_palette: mapping.into_palette(),
                 bit_width: 0,
                 u64_div_bit_width: 0,
@@ -82,7 +78,6 @@ impl<P: PaletteCtx> PackedBlockMap<P> {
             let mask = (1u64 << bit_width) - 1;
 
             Self {
-                palette: origin,
                 local_palette: mapping.into_palette(),
                 bit_width,
                 u64_div_bit_width,
@@ -91,15 +86,13 @@ impl<P: PaletteCtx> PackedBlockMap<P> {
             }
         }
     }
-    pub fn get(&self, x: usize, z: usize) -> (BlockId, Option<&[u8]>) {
-        // NOTE: maybe i should just reuse the existing unpacking code here
-
+    pub fn get(&self, x: usize, z: usize) -> BlockId {
         debug_assert!(x <= 511 && z <= 511);
         debug_assert!(!self.local_palette.is_empty());
 
         if self.local_palette.len() == 1 {
             let id = self.local_palette[0];
-            return (id, self.palette.get_block_name(id));
+            return id;
         };
         let idx = x + z * 512;
 
@@ -110,8 +103,8 @@ impl<P: PaletteCtx> PackedBlockMap<P> {
         let pal_idx = ((self.packed[u64_idx] >> (j * self.bit_width)) & self.mask) as usize;
 
         debug_assert!(pal_idx < self.local_palette.len());
-        let id = self.local_palette[pal_idx];
-        (id, self.palette.get_block_name(id))
+
+        self.local_palette[pal_idx]
     }
 }
 
@@ -308,7 +301,6 @@ fn pack_numbers<const BIT_WIDTH: usize, T>(nums: &[T], f: impl Fn(&T) -> u64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::palette::DummyPalette;
     use rand::{SeedableRng, seq::IndexedRandom, seq::IteratorRandom};
 
     fn get_data(target_bit_width: usize) -> BlockMap {
@@ -336,12 +328,12 @@ mod tests {
     fn roundtrip() {
         for target_bit_width in 1..=12 {
             let block_map = get_data(target_bit_width);
-            let packed = PackedBlockMap::new(&block_map, Arc::new(DummyPalette));
+            let packed = PackedBlockMap::new(&block_map);
 
             for (i, id_from_array) in block_map.iter().copied().enumerate() {
                 let x = i % 512;
                 let z = i / 512;
-                let id_from_packed = packed.get(x, z).0;
+                let id_from_packed = packed.get(x, z);
 
                 assert_eq!(id_from_array, id_from_packed,);
             }

@@ -10,6 +10,8 @@ pub mod region;
 pub mod renderer;
 pub mod worker;
 
+pub mod worlds_scan;
+
 static_assertions::assert_type_eq_all!(slint::wgpu_30::wgpu::Device, vello::wgpu::Device);
 
 #[macro_export]

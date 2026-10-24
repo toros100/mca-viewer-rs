@@ -2,6 +2,10 @@
 members = ["mca_viewer_rs", "nbt", "nbt_derive", "mca_tools"]
 resolver = "3"
 
+[profile.release-checked]
+inherits = "release"
+debug-assertions = true
+
 [profile.best]
 inherits = "release"
 codegen-units = 1

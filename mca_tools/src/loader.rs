@@ -33,7 +33,7 @@ pub enum McaError {
     #[error("bad data")]
     BadData,
 
-    #[error("invalid header: {:?}", .0)]
+    #[error("decompression error: {:?}", .0)]
     DecompressionError(#[from] libdeflater::DecompressionError),
 
     #[error("Io error: {:?}", .0)]
@@ -41,7 +41,7 @@ pub enum McaError {
 }
 
 impl McaLoader {
-    pub fn load_mca<R: std::io::Read>(&mut self, mut read: R) -> Result<(), McaError> {
+    pub fn load_mca(&mut self, mut read: impl std::io::Read) -> Result<(), McaError> {
         self.data.clear();
         let n = read.read_to_end(&mut self.data)?;
         if n < 8192 {
@@ -49,33 +49,38 @@ impl McaLoader {
         }
         Ok(())
     }
+
     pub fn raw_bytes(&self) -> &[u8] {
         &self.data
     }
-    fn get_chunk_pos(&self, idx: usize) -> Result<(u32, u8), McaError> {
+
+    fn get_chunk_pos(&self, i: usize) -> Result<(u32, u8), McaError> {
         if self.data.is_empty() {
             panic!("no data loaded")
         }
-        if idx >= 1024 {
+        if i >= 1024 {
             panic!("index out of bounds")
         }
 
-        if self.data.len() < idx * 4 + 4 {
+        if self.data.len() < i * 4 + 4 {
             return Err(McaError::UnexpectedEof);
         }
 
         let v = u32::from_be_bytes([
-            self.data[idx * 4],
-            self.data[idx * 4 + 1],
-            self.data[idx * 4 + 2],
-            self.data[idx * 4 + 3],
+            self.data[i * 4],
+            self.data[i * 4 + 1],
+            self.data[i * 4 + 2],
+            self.data[i * 4 + 3],
         ]);
         let off = v >> 8;
         let len = (v & 0xff) as u8;
         Ok((off, len))
     }
-    pub fn get_chunk_data(&mut self, idx: usize) -> Result<&[u8], McaError> {
-        let (off, len) = self.get_chunk_pos(idx)?;
+
+    /// returns the decompressed chunk data of the chunk with index i
+    /// may only be called with i < 1024 and after a successful call of Loader::load_mca
+    pub fn get_chunk_data(&mut self, i: usize) -> Result<&[u8], McaError> {
+        let (off, len) = self.get_chunk_pos(i)?;
 
         if off < 2 || len == 0 {
             return Err(McaError::ChunkNotFound);

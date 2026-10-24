@@ -124,6 +124,33 @@ pub fn parse_field_attrs(field: syn::Field) -> syn::Result<Option<ProcessedField
     }
 }
 
+#[derive(Default)]
+pub struct StructAttributes {
+    pub exit_early: bool,
+}
+
+// NOTE: only really applicable to derive(DeserializePayload)
+pub fn parse_struct_attrs(attrs: &[syn::Attribute]) -> syn::Result<StructAttributes> {
+    let mut ca = StructAttributes::default();
+    for attr in attrs {
+        if attr.path().is_ident("nbt") {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("exit_early") {
+                    // is this fine? does this break in ways i have not thought about? seems sketchy
+                    if meta.input.peek(syn::Token![=]) {
+                        return Err(meta.error("exit_early takes no value"));
+                    }
+                    ca.exit_early = true;
+                } else {
+                    return Err(meta.error("unknown attribute"));
+                }
+                Ok(())
+            })?;
+        }
+    }
+    Ok(ca)
+}
+
 pub fn get_borrow_lifetime(input: &DeriveInput) -> syn::Result<Option<&LifetimeParam>> {
     let mut lts = input.generics.lifetimes();
 

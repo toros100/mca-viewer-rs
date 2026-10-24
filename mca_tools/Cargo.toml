@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 libdeflater = "1.26.1"
 thiserror = "2"
+nbt = {path = "../nbt"}

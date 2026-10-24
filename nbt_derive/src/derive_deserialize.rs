@@ -1,4 +1,6 @@
-use crate::{LifetimeSubstitution, get_borrow_lifetime, insert_lifetime, process_fields};
+use crate::{
+    LifetimeSubstitution, get_borrow_lifetime, insert_lifetime, parse_struct_attrs, process_fields,
+};
 use quote::{ToTokens, quote, quote_spanned};
 use syn::DeriveInput;
 use syn::spanned::Spanned;
@@ -28,20 +30,35 @@ pub fn derive_deserialize_payload_inner(
     };
 
     let fields = process_fields(fs)?;
+    let attrs = parse_struct_attrs(&input.attrs)?;
+
+    let exit_early = attrs.exit_early;
 
     let mut cases: Vec<proc_macro2::TokenStream> = Vec::new();
-    let mut field_names: Vec<String> = Vec::new();
+    let mut post_check: Vec<proc_macro2::TokenStream> = vec![];
 
     for (i, f) in fields.iter().enumerate() {
         let field_ident = f.field.ident.clone().unwrap();
 
         let field_str = &f.name_string;
 
-        field_names.push(field_str.clone());
-
         let field_str_bytes =
             syn::LitByteStr::new(f.name_string.as_bytes(), proc_macro2::Span::call_site());
         let ty = &f.field.ty;
+
+        if f.optional {
+            post_check.push(quote! {
+                if !found_fields[#i] {
+                    ::nbt::Optional::handle_absent(&mut self.#field_ident);
+                }
+            })
+        } else {
+            post_check.push(quote! {
+                if !found_fields[#i] {
+                    return Err(::nbt::DeserializationError::FieldNotFound(#field_str));
+                }
+            })
+        }
 
         cases.push(quote! {
             #field_str_bytes => {
@@ -56,8 +73,15 @@ pub fn derive_deserialize_payload_inner(
                     })
                 };
 
-                off += self.#field_ident.deserialize_payload(&data[off..])?;
+                off += ::nbt::DeserializePayload::deserialize_payload(&mut self.#field_ident, &data[off..])?;
+
                 found_fields[#i] = true;
+                if EXIT_EARLY {
+                    remaining_fields -= 1;
+                    if remaining_fields == 0 {
+                        return Ok(off);
+                    }
+                }
             }
         });
     }
@@ -125,13 +149,6 @@ pub fn derive_deserialize_payload_inner(
         is_optional_bools.push(quote! {#opt});
     }
 
-    let _sanitize_calls = fields.iter().map(|f| {
-        let field_ident = f.field.ident.clone().unwrap();
-        quote! {
-            self.#field_ident.sanitize();
-        }
-    });
-
     Ok(quote! {
         impl #impl_generics ::nbt::DeserializePayload<#trait_lt> for #name #ty_generics #where_clause {
             const TAG: ::nbt::Tag = ::nbt::Tag::Compound;
@@ -141,12 +158,14 @@ pub fn derive_deserialize_payload_inner(
                 #assert_impl_optional_fn
                 #(#impl_optional_asserts)*
 
-                static FIELD_NAMES: &[&str] = &[#(#field_names),*];
                 const NUM_FIELDS : usize = #num_fields;
-                let field_optional : [bool; NUM_FIELDS] = [#(#is_optional_bools),*];
+                const EXIT_EARLY : bool = #exit_early;
+                const FIELD_OPTIONAL: [bool; NUM_FIELDS] = [#(#is_optional_bools),*];
+
                 let data_len = data.len();
                 let mut off = 0;
                 let mut found_fields = [false; NUM_FIELDS];
+                let mut remaining_fields = NUM_FIELDS;
 
                 loop {
                     if off >= data_len {
@@ -168,11 +187,7 @@ pub fn derive_deserialize_payload_inner(
                     }
                 }
 
-                for (i, v) in found_fields.iter().enumerate() {
-                    if !v && !field_optional[i] {
-                        return Err(::nbt::DeserializationError::FieldNotFound(FIELD_NAMES[i]));
-                    }
-                }
+                #(#post_check)*
 
 
                 Ok(off)

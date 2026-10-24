@@ -1,4 +1,4 @@
-use std::ops::Index;
+use std::ops::{Deref, DerefMut, Index};
 
 use nbt::{
     ConstBytes, DeserializationError, DeserializePayload, arrays::LongArrayBytes, read_i32_len,
@@ -7,56 +7,121 @@ use nbt::{
 use crate::{block_id::BlockId, palette::PaletteCtx};
 use mca_tools::bitpack::{PackedIndices, PackedIndicesError};
 
-#[derive(DeserializePayload)]
-pub struct Chunk<'a> {
-    #[nbt(rename = "Status")]
-    pub status: StatusMinecraftFull,
+#[derive(Default)]
+pub struct ReusingVec<T> {
+    virtual_len: usize,
+    inner: Vec<T>,
+}
 
-    pub sections: Vec<Section<'a>>,
-    #[nbt(rename = "yPos")]
-    pub y_pos: i32,
+impl<T> Deref for ReusingVec<T> {
+    type Target = [T];
+    fn deref(&self) -> &Self::Target {
+        &self.inner[..self.virtual_len]
+    }
+}
 
-    #[nbt(rename = "Heightmaps")]
-    pub heightmaps: Heightmaps,
+impl<T> DerefMut for ReusingVec<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner[..self.virtual_len]
+    }
+}
 
-    #[nbt(skip)]
+impl<T> ReusingVec<T> {
+    /// WARN: does not actually drop elements, just sets the virtual length to 0
+    fn clear(&mut self) {
+        self.virtual_len = 0;
+    }
+
+    fn push(&mut self, t: T) {
+        if self.virtual_len < self.inner.len() {
+            self.inner[self.virtual_len] = t
+        } else {
+            self.inner.push(t)
+        }
+        self.virtual_len += 1
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        if self.inner.capacity() < self.virtual_len + additional {
+            let additional = additional - (self.inner.len() - self.virtual_len);
+            self.inner.reserve(additional);
+        }
+    }
+
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            inner: Vec::with_capacity(cap),
+            virtual_len: 0,
+        }
+    }
+
+    fn resize_with(&mut self, new_len: usize, f: impl FnMut() -> T) {
+        if new_len > self.virtual_len {
+            self.inner.resize_with(new_len, f);
+        }
+        self.virtual_len = new_len;
+    }
+}
+
+impl<'d, T> DeserializePayload<'d> for ReusingVec<T>
+where
+    T: DeserializePayload<'d> + Default,
+{
+    const TAG: nbt::Tag = nbt::Tag::List;
+    fn deserialize_payload(&mut self, data: &'d [u8]) -> nbt::DeserializationResult<usize> {
+        if data.len() < 5 {
+            return Err(DeserializationError::EOF);
+        };
+
+        let t = nbt::Tag::try_from(data[0])?;
+        let mut off = 1;
+
+        if t != T::TAG {
+            return Err(DeserializationError::UnexpectedTag {
+                expected: T::TAG,
+                found: t,
+            });
+        }
+
+        let len = read_i32_len(&data[off..])?;
+        off += 4;
+
+        self.resize_with(len, || T::default());
+
+        for v in self.iter_mut() {
+            off += v.deserialize_payload(&data[off..])?;
+        }
+
+        Ok(off)
+    }
+}
+
+pub struct ChunkSections<'a> {
+    sections: ReusingVec<Section<'a>>,
     air_info: BlockInfo,
-
-    #[nbt(skip)]
     pub y_limit: u16,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum DataError {
-    #[error("no sections found")]
-    NoSections,
-    #[error("unexpected sections layout")]
-    UnexpectedSectionsLayout,
-    #[error("empty palette")]
-    EmptyPalette,
-    #[error("packed indices error: {:?}", .0)]
-    PackedIndices(#[from] PackedIndicesError),
+impl<'d> DeserializePayload<'d> for ChunkSections<'d> {
+    const TAG: nbt::Tag = nbt::Tag::List;
+    fn deserialize_payload(&mut self, data: &'d [u8]) -> nbt::DeserializationResult<usize> {
+        self.sections.deserialize_payload(data)
+    }
 }
 
-impl<'a> Chunk<'a> {
-    /// consumes a Chunk<'a> (typically with borrowed data), clears any references with lifetime 'a
-    /// and returns Chunk<'static> using unsafe
-    pub fn reclaim(mut self) -> Chunk<'static> {
-        self.sanitize();
-        // # Safety
-        // sanitize gets rid of any 'a-lifetimed references in self (currently only in Vec and
-        // Option, which are cleared resp. set to None).
-        //
-        // i believe this is actually sound, what could possibly go wrong?
-        //
-        unsafe { std::mem::transmute::<Chunk<'a>, Chunk<'static>>(self) }
+impl Default for ChunkSections<'_> {
+    fn default() -> Self {
+        Self {
+            sections: ReusingVec::with_capacity(24),
+            y_limit: 0,
+            air_info: BlockInfo::default(),
+        }
     }
+}
 
+impl<'a> ChunkSections<'a> {
     pub fn sanitize(&mut self) {
-        // NOTE: deliberately NOT clearing self.sections, so we can keep the delicious heap
-        // allocations inside the invidual sections
-        self.y_limit = 0;
-        for s in self.sections.iter_mut() {
+        for s in self.sections.inner.iter_mut() {
             s.block_states.sanitize();
         }
     }
@@ -72,19 +137,16 @@ impl<'a> Chunk<'a> {
         self.y_limit = 16 * ((max_section_idx - min_section_idx) as u16 + 1);
 
         for s in self.sections.iter_mut() {
-            let l = s.block_states.palette.len();
-            if l == 0 {
-                return Err(DataError::EmptyPalette);
-            }
-
-            if l == 1 {
-                s.block_states.indices = SectionIndices::Zero;
-            } else {
-                let packed = PackedIndices::new(
-                    s.block_states.data.as_ref().map_or(&[], |b| b.as_slice()),
-                    l,
-                )?;
-                s.block_states.indices = SectionIndices::Packed(packed);
+            match s.block_states.palette.len() {
+                0 => return Err(DataError::EmptyPalette),
+                1 => s.block_states.indices = SectionIndices::Zero,
+                n => {
+                    let packed = PackedIndices::new(
+                        s.block_states.data.as_ref().map_or(&[], |b| b.as_slice()),
+                        n,
+                    )?;
+                    s.block_states.indices = SectionIndices::Packed(packed);
+                }
             }
 
             s.block_states.cached_palette.clear();
@@ -105,7 +167,7 @@ impl<'a> Chunk<'a> {
         let air_col = p.get_color(air_id);
 
         self.air_info = BlockInfo {
-            id: air_id,
+            id: BlockId::INVALID,
             color: air_col,
             is_airy: true,
             is_watery: true,
@@ -124,13 +186,12 @@ impl<'a> Chunk<'a> {
     ) -> Option<(u16, BlockInfo)> {
         debug_assert!(x < 16);
         debug_assert!(z < 16);
-        debug_assert!(y < self.y_limit);
 
         let mut section_idx = (y as usize) / 16;
         let mut local_y = y % 16;
 
         loop {
-            let s = self.sections.get_mut(section_idx)?;
+            let s = &mut self.sections.get_mut(section_idx)?;
             let c = s.block_states.non_airy_at_or_below(x, local_y, z, limit, p);
             if c.is_some() {
                 return c.map(|(yy, b)| (yy + (section_idx as u16) * 16, b));
@@ -183,9 +244,8 @@ impl<'a> Chunk<'a> {
     pub fn block_at<P: PaletteCtx>(&mut self, x: u16, y: u16, z: u16, p: &P) -> BlockInfo {
         debug_assert!(x < 16);
         debug_assert!(z < 16);
-        debug_assert!(y < self.y_limit);
 
-        match self.section_for_y(y) {
+        match self.sections.get_mut((y as usize) / 16) {
             Some(s) => {
                 let block_idx = (y % 16) * 256 + 16 * z + x;
                 // NOTE: observe that block_idx <= 4095 by the above asserts
@@ -196,48 +256,72 @@ impl<'a> Chunk<'a> {
             None => self.air_info,
         }
     }
+}
 
-    fn section_for_y(&mut self, y: u16) -> Option<&mut Section<'a>> {
-        self.sections.get_mut((y as usize) / 16)
+#[derive(Default, DeserializePayload)]
+pub struct Chunk<'a> {
+    #[nbt(rename = "Status")]
+    pub status: StatusMinecraftFull,
+
+    pub sections: ChunkSections<'a>,
+    #[nbt(rename = "yPos")]
+    pub y_pos: i32,
+
+    #[nbt(rename = "Heightmaps")]
+    pub heightmaps: Heightmaps,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DataError {
+    #[error("no sections found")]
+    NoSections,
+    #[error("unexpected sections layout")]
+    UnexpectedSectionsLayout,
+    #[error("empty palette")]
+    EmptyPalette,
+    #[error("packed indices error: {:?}", .0)]
+    PackedIndices(#[from] PackedIndicesError),
+}
+
+impl<'a> Chunk<'a> {
+    /// consumes a Chunk<'a> (typically with borrowed data), clears any references with lifetime 'a
+    /// and returns Chunk<'static> using unsafe
+    pub fn reclaim(mut self) -> Chunk<'static> {
+        self.sections.sanitize();
+        // # Safety
+        // sanitize gets rid of any 'a-lifetimed references in self (currently only in Vec and
+        // Option, which are cleared resp. set to None).
+        //
+        // i believe this is actually sound, what could possibly go wrong?
+        //
+        unsafe { std::mem::transmute::<Chunk<'a>, Chunk<'static>>(self) }
     }
 }
 
-impl Default for Chunk<'_> {
-    fn default() -> Self {
-        Self {
-            status: StatusMinecraftFull,
-            sections: Vec::with_capacity(24),
-            heightmaps: Heightmaps::default(),
-            y_limit: 0u16,
-            air_info: Default::default(),
-            y_pos: 0,
-        }
-    }
+/// chunk type for slice mode, which does not need heightmaps
+/// (and the exit_early appears to skip slightly more here, probably not relevant)
+#[derive(Default, DeserializePayload)]
+#[nbt(exit_early)]
+pub struct SliceChunk<'a> {
+    #[nbt(rename = "Status")]
+    pub status: StatusMinecraftFull,
+
+    pub sections: ChunkSections<'a>,
+
+    #[nbt(rename = "yPos")]
+    pub y_pos: i32,
 }
 
-#[derive(DeserializePayload, Default)]
-pub struct Heightmaps {
-    #[nbt(rename = "WORLD_SURFACE")]
-    world_surface: Heightmap,
-    #[nbt(rename = "OCEAN_FLOOR")]
-    ocean_floor: Heightmap,
-}
-
-impl Heightmaps {
-    #[inline]
-    pub fn world_surface_at(&self, x: u16, z: u16) -> u16 {
-        let idx = z * 16 + x;
-        unpack_u9_from_u64s(&self.world_surface.0, idx as usize)
-    }
-    #[inline]
-    pub fn ocean_floor_at(&self, x: u16, z: u16) -> u16 {
-        let idx = z * 16 + x;
-        unpack_u9_from_u64s(&self.ocean_floor.0, idx as usize)
+impl<'a> SliceChunk<'a> {
+    // cf. Chunk::reclaim
+    pub fn reclaim(mut self) -> SliceChunk<'static> {
+        self.sections.sanitize();
+        unsafe { std::mem::transmute::<SliceChunk<'a>, SliceChunk<'static>>(self) }
     }
 }
 
 #[inline]
-pub fn unpack_u9_from_u64s(longs: &[u64], idx: usize) -> u16 {
+pub fn unpack_u9_from_u64s(longs: &[u64; 37], idx: usize) -> u16 {
     const BIT_WIDTH: usize = 9;
     const LAST_9_MASK: u64 = (1 << BIT_WIDTH) - 1;
     const NUMS_PER_LONG: usize = 64 / BIT_WIDTH;
@@ -248,7 +332,32 @@ pub fn unpack_u9_from_u64s(longs: &[u64], idx: usize) -> u16 {
     ((u >> (i * BIT_WIDTH)) & LAST_9_MASK) as u16
 }
 
+// it appears to be optimal to only pre-unpack the world surface heightmap but not the ocean floor
+// one. makes sense given the access pattern: world surface generally gets accessed multiple times
+// per position (local height difference computation), ocean floor at most once
+#[derive(DeserializePayload, Default)]
+pub struct Heightmaps {
+    #[nbt(rename = "WORLD_SURFACE")]
+    world_surface: UnpackedHeightmap,
+    #[nbt(rename = "OCEAN_FLOOR")]
+    ocean_floor: Heightmap,
+}
+
+impl Heightmaps {
+    #[inline]
+    pub fn world_surface_at(&self, x: u16, z: u16) -> u16 {
+        let idx = z * 16 + x;
+        self.world_surface.0[idx as usize]
+    }
+    #[inline]
+    pub fn ocean_floor_at(&self, x: u16, z: u16) -> u16 {
+        let idx = z * 16 + x;
+        unpack_u9_from_u64s(&self.ocean_floor.0, idx as usize)
+    }
+}
+
 pub struct Heightmap([u64; 37]);
+
 impl Default for Heightmap {
     fn default() -> Self {
         Self([0u64; 37])
@@ -273,6 +382,62 @@ impl DeserializePayload<'_> for Heightmap {
         } else {
             u64x37_from_be_bytes(&mut self.0, &data[4..4 + 37 * 8].try_into().unwrap());
         }
+        Ok(4 + 37 * 8)
+    }
+}
+
+pub struct UnpackedHeightmap([u16; 256]);
+
+impl Default for UnpackedHeightmap {
+    fn default() -> Self {
+        Self([0u16; 256])
+    }
+}
+
+impl UnpackedHeightmap {
+    fn unpack_from(&mut self, data: &[u8; 37 * 8]) {
+        const BIT_WIDTH: usize = 9;
+        const LAST_9_MASK: u64 = (1 << BIT_WIDTH) - 1;
+        const NUMS_PER_LONG: usize = 64 / BIT_WIDTH;
+
+        fn unpack(bs: [u8; 8]) -> [u16; NUMS_PER_LONG] {
+            let u = u64::from_be_bytes(bs);
+            std::array::from_fn(|i| ((u >> (i * BIT_WIDTH)) & LAST_9_MASK) as u16)
+        }
+
+        let (cs, _) = data.as_chunks::<8>();
+
+        let (ds, rem) = self.0.as_chunks_mut::<7>();
+
+        // comptime known:
+        // ds.len() == 36
+        // rem.len() == 4
+
+        for (d, c) in ds.iter_mut().zip(cs.iter().copied()) {
+            *d = unpack(c)
+        }
+
+        for (d, v) in rem.iter_mut().zip(unpack(cs[36])) {
+            *d = v
+        }
+    }
+}
+
+impl DeserializePayload<'_> for UnpackedHeightmap {
+    const TAG: nbt::Tag = nbt::Tag::LongArray;
+    fn deserialize_payload(&mut self, data: &'_ [u8]) -> nbt::DeserializationResult<usize> {
+        let l = read_i32_len(data)?;
+        if l != 37 {
+            return Err(DeserializationError::Custom(
+                "unexected array length".into(),
+            ));
+        }
+        if data.len() < 4 + 37 * 8 {
+            return Err(DeserializationError::EOF);
+        }
+
+        self.unpack_from(&data[4..4 + 37 * 8].try_into().unwrap());
+
         Ok(4 + 37 * 8)
     }
 }
@@ -444,7 +609,7 @@ pub struct BlockStates<'a> {
     all_watery: bool,
 
     #[nbt(skip)]
-    pub cached_palette: Vec<BlockInfo>,
+    pub cached_palette: ReusingVec<BlockInfo>,
 
     #[nbt(skip)]
     cached_palette_ok: bool,
@@ -609,7 +774,7 @@ impl Default for BlockStates<'_> {
     fn default() -> Self {
         Self {
             palette: Palette::with_capacity(10),
-            cached_palette: Vec::with_capacity(10),
+            cached_palette: ReusingVec::with_capacity(10),
             data: None,
             bit_width: 0,
             cached_palette_ok: false,
@@ -621,13 +786,22 @@ impl Default for BlockStates<'_> {
 }
 
 fn is_airy(block: &[u8]) -> bool {
-    block == b"minecraft:air" || block == b"minecraft:cave_air"
+    matches!(block, b"minecraft:air" | b"minecraft:cave_air",)
 }
 
 fn is_watery(block: &[u8]) -> bool {
     // NOTE: skipping air here because we don't want to draw air
-    block == b"minecraft:air"
-        || block == b"minecraft:cave_air"
-        || block == b"minecraft:water"
-        || block == b"minecraft:bubble_column"
+    // not filtering the water plants makes the water darkening look bad (bright spots)
+
+    matches!(
+        block,
+        b"minecraft:air"
+            | b"minecraft:cave_air"
+            | b"minecraft:water"
+            | b"minecraft:bubble_column"
+            | b"minecraft:tall_seagrass"
+            | b"minecraft:seagrass"
+            | b"minecraft:kelp_plant"
+            | b"minecraft:kelp"
+    )
 }

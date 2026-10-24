@@ -1,6 +1,6 @@
 use clap::Parser;
 use mca_viewer_rs::palette::{BlockPalette, TomlPalette};
-use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
+use std::{num::NonZeroUsize, sync::Arc};
 
 mod app;
 
@@ -9,9 +9,9 @@ const PALETTE_TOML_STR: &str = include_str!("../palette.toml");
 
 #[derive(clap::Parser)]
 struct Args {
-    #[arg(long, short)]
-    path: PathBuf,
-
+    // should probably still have the path arg for dev
+    // #[arg(long, short)]
+    // path: PathBuf,
     #[arg(long, short)]
     num_workers: Option<NonZeroUsize>,
 }
@@ -35,8 +35,6 @@ fn main() -> anyhow::Result<()> {
     let ctx = BlockPalette::new(TomlPalette::try_from(PALETTE_TOML_STR)?, [255, 0, 255, 255]);
 
     let app = app::new(num_workers, Arc::new(ctx))?;
-
-    app.borrow_mut().load_dir(&args.path)?;
 
     app.run()
 }

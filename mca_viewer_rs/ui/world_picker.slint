@@ -1,0 +1,155 @@
+import { Button, ScrollView } from "std-widgets.slint";
+
+export struct WorldInfo {
+    name: string,
+    version: string,
+    last_played: string,
+    overworld_regions: int,
+    nether_regions: int,
+    end_regions: int,
+}
+
+export component WorldPicker inherits Rectangle {
+    border-width: 1px;
+    border-color: black;
+    border-radius: 6px;
+    background: #272727;
+    drop-shadow-color: #00000055;
+    drop-shadow-blur: 6px;
+    in property <[WorldInfo]> worlds;
+
+    callback close();
+    callback pick_dir();
+    callback select_world(int);
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 8px;
+
+        property <length> col_pad_lr: 8px;
+        property <length> col_w: (sv.visible-width - 2 * col_pad_lr - 8px) / 3;
+        v := VerticalLayout {
+
+            Rectangle {
+                HorizontalLayout {
+                    padding: 8px;
+                    Text {
+                        width: col_w;
+                        text: "World name";
+                        font-weight: FontWeight.semi-bold;
+                    }
+
+                    Text {
+                        width: col_w;
+                        text: "Game version";
+                        font-weight: FontWeight.semi-bold;
+                    }
+
+                    Text {
+                        width: col_w - 16px;
+                        text: "Last played";
+                        font-weight: FontWeight.semi-bold;
+                    }
+                }
+            }
+
+            in-out property <int> active_idx: -1;
+            sv := ScrollView {
+                VerticalLayout {
+                    alignment: start;
+                    for world[i] in root.worlds: Rectangle {
+                        width: sv.visible-width - 8px;
+                        background: t.has-hover || i == active_idx ? #FFFFFF20 : transparent;
+                        border-width: 1px;
+                        border-color: i == active_idx ? #FFFFFF40 : transparent;
+                        VerticalLayout {
+                            padding-left: col_pad_lr;
+                            padding-right: col_pad_lr;
+                            padding-top: 4px;
+                            padding-bottom: 4px;
+                            HorizontalLayout {
+
+                                alignment: start;
+                                Text {
+                                    width: col_w;
+                                    text: world.name;
+                                    overflow: TextOverflow.elide;
+                                    wrap: TextWrap.word-wrap;
+                                }
+
+                                Text {
+                                    width: col_w;
+                                    text: world.version;
+                                    overflow: TextOverflow.elide;
+                                    wrap: TextWrap.word-wrap;
+                                }
+
+                                Text {
+                                    width: col_w;
+                                    text: world.last-played;
+                                    overflow: TextOverflow.elide;
+                                    wrap: TextWrap.word-wrap;
+                                }
+                            }
+
+                            if (i == active_idx): VerticalLayout {
+                                padding: 8px;
+
+                                property <bool> any_dims: world.overworld-regions > 0 || world.nether-regions > 0 || world.end-regions > 0;
+
+                                if (!any_dims): Text {
+                                    text: "No region files found";
+                                }
+
+                                if (world.overworld-regions > 0): Text {
+                                    text: "Overworld: \{world.overworld-regions} regions";
+                                }
+                                if (world.nether-regions > 0): Text {
+                                    text: "Nether: \{world.nether-regions} regions";
+                                }
+                                if (world.end-regions > 0): Text {
+                                    text: "End: \{world.end-regions} regions";
+                                }
+                            }
+                        }
+
+                        t := TouchArea {
+                            clicked => {
+                                if (i == active_idx) {
+                                    active_idx = -1;
+                                } else {
+                                    active_idx = i;
+                                }
+                            }
+                            double-clicked => {
+                                root.select_world(i);
+                                root.close();
+                            }
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                padding: 8px;
+                padding-top: 16px;
+                spacing: 8px;
+
+                Button {
+                    text: "Choose directory";
+                    clicked => { root.pick_dir() }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                Button {
+                    enabled: active_idx != -1;
+                    text: "Select world";
+                    clicked => { root.select_world(active_idx); root.close() }
+                }
+            }
+        }
+    }
+}

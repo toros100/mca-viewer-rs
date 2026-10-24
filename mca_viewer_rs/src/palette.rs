@@ -32,17 +32,40 @@ impl PaletteCtx for DummyPalette {
     fn get_color(&self, _: BlockId) -> [u8; 4] {
         [255, 0, 255, 255]
     }
-    fn get_or_intern_block_id(&self, _: &[u8]) -> BlockId {
-        BlockId::INVALID
+    fn get_or_intern_block_id(&self, bs: &[u8]) -> BlockId {
+        match bs {
+            b"minecraft:air" => BlockId::from(1),
+            b"minecraft:water" => BlockId::from(2),
+            b"minecraft:dirt" => BlockId::from(3),
+            b"minecraft:grass_block" => BlockId::from(4),
+            _ => BlockId::INVALID,
+        }
     }
-    fn get_block_name(&self, _: BlockId) -> Option<&[u8]> {
-        None
+    fn get_block_name(&self, id: BlockId) -> Option<&[u8]> {
+        let i = usize::from(id);
+        match i {
+            1 => Some(b"minecraft:air"),
+            2 => Some(b"minecraft:water"),
+            3 => Some(b"minecraft:dirt"),
+            4 => Some(b"minecraft:grass_block"),
+            _ => None,
+        }
     }
 }
 
 pub struct BlockPalette {
     pub palette: VecPalette,
     pub interner: BlockInterner,
+}
+
+// WARN: acquires read lock on self.interner, this can block
+impl Clone for BlockPalette {
+    fn clone(&self) -> Self {
+        Self {
+            palette: self.palette.clone(),
+            interner: self.interner.deep_clone(),
+        }
+    }
 }
 
 impl BlockPalette {
@@ -63,38 +86,38 @@ impl BlockPalette {
         }
     }
 
-    pub fn set_color(&mut self, id: BlockId, c: [u8; 4]) {
-        self.palette.set_color(id, c);
+    pub fn set_color_if_id_present(&mut self, id: BlockId, c: [u8; 4]) {
+        self.palette.set_color_if_present(id, c);
     }
+
+    // pub fn set_color(&mut self, id: BlockId, c: [u8; 4]) {
+    //     self.palette.set_color(id, c);
+    // }
 
     pub fn has_color(&self, id: BlockId) -> bool {
         id != BlockId::INVALID && id < self.interner.static_interner.max_exclusive
     }
 
-    // HACK:
     pub fn iter_entries(&self) -> impl Iterator<Item = (BlockId, &'static [u8], [u8; 4], bool)> {
-        let default_col = self.palette.static_palette[0];
-        let mni = self.palette.max_known_id();
-
-        self.palette
-            .iter()
-            .filter_map(|(id, col, mapped)| {
-                let bs = *self.interner.static_interner.id_to_bytes.get(&id)?;
-                Some((id, bs, col, mapped))
-            })
-            .chain(self.interner.static_interner.id_to_bytes.iter().filter_map(
-                move |(&id, &name)| {
-                    if id > mni {
-                        Some((id, name, default_col, false))
-                    } else {
-                        None
-                    }
-                },
-            ))
+        self.palette.iter().map(|(id, col, mapped)| {
+            let bs = *self
+                .interner
+                .static_interner
+                .id_to_bytes
+                .get(&id)
+                .expect("should be some at this point");
+            (id, bs, col, mapped)
+        })
     }
 
     pub fn fix(&mut self) {
         self.interner.fix();
+        self.palette.reserve(
+            self.interner
+                .static_interner
+                .max_id()
+                .unwrap_or(BlockId::INVALID),
+        );
     }
 
     pub fn get_block_id(&self, bs: &[u8]) -> Option<BlockId> {
@@ -140,7 +163,10 @@ pub struct VecPalette {
     // static_palette and mapped should always have the same nonzero length
     //
     // static_palette[i] is the color for BlockId(i)
-    // mapped[i] is true iff the color for BlockId(i) is explicitly set
+    //
+    // static_palette[0] is the default color (recall BlockId(0) == BlockId::INVALID)
+    //
+    // mapped[i] is true iff the color for BlockId(i) is explicitly set (arbitrary for i=0)
     static_palette: Vec<[u8; 4]>,
     mapped: Vec<bool>,
 }
@@ -155,6 +181,10 @@ impl VecPalette {
         self.static_palette.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (BlockId, [u8; 4], bool)> {
         self.static_palette
             .iter()
@@ -165,6 +195,30 @@ impl VecPalette {
                 let id = (i as u16).into();
                 (id, *c, *b)
             })
+    }
+
+    fn set_color_if_present(&mut self, id: BlockId, c: [u8; 4]) {
+        if id == BlockId::INVALID {
+            // not meaningful
+            return;
+        }
+        let i = usize::from(id);
+        if self.static_palette.len() > i {
+            self.static_palette[i] = c;
+            self.mapped[i] = true;
+        }
+    }
+
+    fn reserve(&mut self, id: BlockId) {
+        let i = usize::from(id);
+        if i >= self.static_palette.len() {
+            let default_col = self.static_palette[0];
+
+            let d = (i + 1).saturating_sub(self.static_palette.len());
+            self.static_palette
+                .extend(std::iter::repeat_n(default_col, d));
+            self.mapped.extend(std::iter::repeat_n(false, d));
+        }
     }
 
     fn set_color(&mut self, id: BlockId, c: [u8; 4]) {
@@ -261,7 +315,7 @@ impl<T> Interner<T> {
     fn len(&self) -> usize {
         let mi = self.min.into_raw();
         let ma = self.max_exclusive.into_raw();
-        debug_assert!(ma == 0 || mi < ma);
+        debug_assert!(ma == 0 || mi <= ma);
         ma.wrapping_sub(mi) as usize
     }
 
@@ -271,6 +325,16 @@ impl<T> Interner<T> {
             0
         } else {
             usize::from(BlockId::MAX) - usize::from(self.max_exclusive) + 1
+        }
+    }
+
+    fn max_id(&self) -> Option<BlockId> {
+        if self.min == self.max_exclusive {
+            None
+        } else {
+            Some(BlockId::from_raw(
+                self.max_exclusive.into_raw().wrapping_sub(1),
+            ))
         }
     }
 

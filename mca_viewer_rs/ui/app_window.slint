@@ -4,7 +4,9 @@ import {
     ScrollView,
     ListView,
     LineEdit,
+    Slider,
 } from "std-widgets.slint";
+
 import {
     PopupMenu,
     PopupMenuButton,
@@ -20,6 +22,9 @@ export struct PaletteEntry {
     is_dirty: bool,
     is_mapped: bool,
 }
+
+import { WorldInfo, WorldPicker } from "world_picker.slint";
+
 
 export enum FilterGroup {
     all,
@@ -157,8 +162,8 @@ export global Notify {
 }
 
 export enum RenderMode {
-    Normal,
-    Slice,
+    normal,
+    slice,
 }
 
 export struct RenderOptions {
@@ -239,16 +244,51 @@ component ColorEditor inherits Rectangle {
     }
 }
 
+export struct YRange {
+    min: int,
+    max: int,
+}
+
+struct ColorEditorState {
+    show: bool,
+    x: length,
+    y: length,
+    target_name: string,
+    target_id: int,
+    color: color,
+}
+
 export component MainWindow inherits Window {
+    preferred-width: 1200px;
+    preferred-height: 1200px;
 
     in property <WorldPosition> world_position;
     in property <BlockAtCursor> block_at_cursor;
     in-out property <RenderOptions> render_options;
+    in-out property <float> slice_height;
+
+    changed render_options => {
+        let h = round(render_options.height) * 1.0;
+        if (slice_height != h) {
+            slice_height = h
+        }
+        if (render_options.mode == normal) {
+            combobox_mode.current-index = 0;
+        } else if (render_options.mode == slice) {
+            combobox_mode.current-index = 1;
+        }
+    }
 
     in property <[PaletteEntry]> palette;
+    in property <[WorldInfo]> worlds;
+    in-out property <int> dimension_choice: -1;
+    in property <[string]> dimensions;
 
-    pure function fmt_world_position(w: WorldPosition) -> string {
-        "block: (\{w.block-x}, \{w.block-z}) - region: (\{w.region-x}, \{w.region-z}) - block in region: (\{w.block-x-in-region}, \{w.block-z-in-region})"
+    changed dimension_choice => {
+        combobox_dim.current-index = dimension_choice;
+    }
+    changed dimensions => {
+        combobox_dim.current-index = dimension_choice;
     }
 
     pure function sign(f: float) -> int {
@@ -261,18 +301,17 @@ export component MainWindow inherits Window {
         }
     }
 
-    preferred-width: 1200px;
-    preferred-height: 1200px;
-
     callback toggle_grid();
 
     callback pointer_event(kind: PointerEventKind, button: PointerEventButton, modifiers: KeyboardModifiers, x: float, y: float);
+
     callback canvas_size_changed(float, float);
 
     callback increase_scale(mouse_x: length, mouse_y: length, is_mouse: bool);
     callback decrease_scale(mouse_x: length, mouse_y: length, is_mouse: bool);
 
     callback change_slice_height(int);
+    callback set_slice_height(int);
 
     callback reset_scale();
 
@@ -288,19 +327,22 @@ export component MainWindow inherits Window {
     callback set_filter_status(FilterStatus);
 
     callback reload_palette();
+    callback center_origin();
 
     callback discard_palette();
     callback apply_palette();
 
+    callback pick_dir();
+    callback select_world(int);
+
+    callback select_dimension(int);
+
     in-out property <length> rcm_x;
     in-out property <length> rcm_y;
 
-    in-out property <bool> show_color_editor;
-    in-out property <length> color_editor_x;
-    in-out property <length> color_editor_y;
-    in-out property <string> color_editor_target;
-    in-out property <int> color_editor_target_id;
-    in-out property <color> color_editor_color;
+    in-out property <ColorEditorState> color_editor_state;
+
+    in-out property <YRange> y_range;
 
     function show_rcm(block: string, mouse_x: length, mouse_y: length) {
         if (block == "") {
@@ -309,14 +351,6 @@ export component MainWindow inherits Window {
         root.rcm_x = round(mouse_x / 1px) * 1px;
         root.rcm_y = round(mouse_y / 1px) * 1px;
         rcm.show();
-    }
-
-    pure function switch_mode(m: RenderMode) -> RenderMode {
-        if (m == RenderMode.Normal) {
-            RenderMode.Slice
-        } else {
-            RenderMode.Normal
-        }
     }
 
     in-out property <image> canvas_image;
@@ -333,35 +367,70 @@ export component MainWindow inherits Window {
             Button {
                 checkable: true;
                 checked: root.show_palette_sidebar;
-                text: "show palette";
+                text: "Palette";
                 clicked => {
                     root.show_palette_sidebar = !root.show_palette_sidebar
                 }
             }
 
             Button {
-                text: "switch mode";
-                clicked => {
-                    let opt = root.render_options;
-                    let m = switch_mode(opt.mode);
-                    root.set_render_options({
-                        mode: m,
-                        height: opt.height,
-                        depth_darken: opt.depth-darken,
-                        block_map: opt.block-map,
-                    })
-                }
-            }
-
-            Button {
-                text: "toggle grid";
+                text: "Toggle grid";
                 clicked => { root.toggle_grid() }
             }
 
             Button {
-                text: "rerender";
+                text: "Rerender";
                 clicked => {
                     root.render()
+                }
+            }
+
+            Button {
+                text: "Select world";
+                clicked => {
+                    worlds_popup.show();
+                }
+            }
+
+            Button {
+                text: "Go to origin";
+                clicked => {
+                    root.center_origin();
+                }
+            }
+
+            combobox_mode := ComboBox {
+                horizontal-stretch: 0;
+                model: ["Normal view", "Slice view"];
+                enabled: root.dimensions.length != 0;
+                changed current-index => {
+                    if (self.current-index == 0) {
+                        let opt = root.render_options;
+                        root.set_render_options({
+                            mode: normal,
+                            height: opt.height,
+                            depth_darken: opt.depth-darken,
+                            block_map: opt.block-map,
+                        });
+                    } else if (self.current-index == 1) {
+                        let opt = root.render_options;
+                        root.set_render_options({
+                            mode: slice,
+                            height: opt.height,
+                            depth_darken: opt.depth-darken,
+                            block_map: opt.block-map,
+                        });
+                    }
+                }
+            }
+
+            combobox_dim := ComboBox {
+                horizontal-stretch: 0;
+                enabled: self.model.length != 0;
+                model <=> root.dimensions;
+                current-index: root.dimension_choice;
+                changed current-index => {
+                    root.select_dimension(self.current-index)
                 }
             }
         }
@@ -474,20 +543,19 @@ export component MainWindow inherits Window {
                         ListView {
 
                             for e in root.palette: Rectangle {
-                                // border-width: 1px;
                                 background: e.is-dirty ? #FFFFFF20 : transparent;
 
                                 PaletteRow {
                                     entry: e;
                                     edit_color => {
-                                        if (!root.show_color_editor) {
-                                            root.color_editor_x = 0;
-                                            root.color_editor_y = 0;
-                                            root.show_color_editor = true;
+                                        if (!root.color_editor_state.show) {
+                                            root.color_editor_state.x = 0;
+                                            root.color_editor_state.y = 0;
+                                            root.color_editor_state.show = true;
                                         }
-                                        root.color_editor_target_id = e.id;
-                                        root.color_editor_target = e.name;
-                                        root.color_editor_color = e.color;
+                                        root.color_editor_state.target_id = e.id;
+                                        root.color_editor_state.target_name = e.name;
+                                        root.color_editor_state.color = e.color;
                                         rcm.close();
                                     }
                                     reset_color => {
@@ -536,6 +604,20 @@ export component MainWindow inherits Window {
             }
 
             foc := FocusScope {
+                worlds_popup := PopupWindow {
+                    min-height: 500px;
+                    width: 800px;
+                    x: parent.width / 2 - self.width / 2;
+                    y: parent.height / 2 - self.height / 2;
+                    close-policy: PopupClosePolicy.close-on-click-outside;
+
+                    WorldPicker {
+                        worlds: root.worlds;
+                        close => { worlds_popup.close() }
+                        pick_dir => { root.pick_dir() }
+                        select_world(i) => { root.select_world(i) }
+                    }
+                }
 
                 rcm := PopupWindow {
                     close_policy: close_on_click_outside;
@@ -562,14 +644,14 @@ export component MainWindow inherits Window {
 
                                 root.show_palette_sidebar = true;
 
-                                if (!root.show_color_editor) {
-                                    root.color_editor_x = root.rcm_x;
-                                    root.color_editor_y = root.rcm_y;
-                                    root.show_color_editor = true;
+                                if (!root.color_editor_state.show) {
+                                    root.color_editor_state.x = root.rcm_x;
+                                    root.color_editor_state.y = root.rcm_y;
+                                    root.color_editor_state.show = true;
                                 }
-                                root.color_editor_target_id = root.block_at_cursor.id;
-                                root.color_editor_target = root.block_at_cursor.name;
-                                root.color_editor_color = root.block_at_cursor.color;
+                                root.color_editor_state.target_id = root.block_at_cursor.id;
+                                root.color_editor_state.target_name = root.block_at_cursor.name;
+                                root.color_editor_state.color = root.block_at_cursor.color;
                                 rcm.close();
                             }
                         }
@@ -599,7 +681,7 @@ export component MainWindow inherits Window {
                                 }
                             }
                             scroll-event(event) => {
-                                if (event.modifiers.control && root.render_options.mode == RenderMode.Slice) {
+                                if (event.modifiers.control && root.render_options.mode == RenderMode.slice) {
                                     let d = root.sign(event.delta-y / 1px);
                                     root.change_slice_height(-d)
                                 } else {
@@ -613,13 +695,67 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
+
+                    if (root.render_options.mode == slice): Rectangle {
+                        x: canvas.width - self.width - 16px;
+                        y: (canvas.height - self.height) / 2;
+                        width: 48px;
+                        height: canvas.height / 2;
+                        border-width: 1px;
+                        border-color: black;
+                        border-radius: 6px;
+                        background: #272727;
+                        drop-shadow-color: #00000055;
+                        drop-shadow-blur: 6px;
+                        HorizontalLayout {
+                            padding: 8px;
+                            alignment: LayoutAlignment.center;
+
+                            VerticalLayout {
+                                spacing: 4px;
+                                Text {
+                                    horizontal-alignment: center;
+                                    text: "y";
+                                }
+
+                                sl := Slider {
+                                    value <=> root.slice_height;
+                                    step: 1;
+                                    minimum: root.y_range.min;
+                                    maximum: root.y_range.max;
+                                    orientation: vertical;
+
+                                    changed(value) => {
+                                        root.set_slice_height(value.round())
+                                    }
+                                }
+
+                                Text {
+                                    horizontal-alignment: center;
+                                    text: "\{round(sl.value)}";
+                                }
+
+                                Button {
+                                    text: "+";
+                                    enabled: sl.value < sl.maximum;
+                                    clicked => { root.change_slice_height(1) }
+                                }
+
+                                Button {
+                                    text: "-";
+                                    enabled: sl.value > sl.minimum;
+                                    clicked => { root.change_slice_height(-1) }
+                                }
+                            }
+                        }
+                    }
                 }
 
-                if root.show_color_editor: color_editor := Rectangle {
+                if root.color_editor_state.show: color_editor := Rectangle {
                     width: self.preferred-width;
                     height: self.preferred-height;
-                    x: round(clamp(root.color_editor_x, 0, canvas.width - self.width) / 1px) * 1px;
-                    y: round(clamp(root.color_editor_y, 0, canvas.height - self.height) / 1px) * 1px;
+                    x: round(clamp(root.color_editor_state.x, 0, canvas.width - self.width) / 1px) * 1px;
+                    y: round(clamp(root.color_editor_state.y, 0, canvas.height - self.height) / 1px) * 1px;
                     clip: true;
                     border-width: 1px;
                     border-color: black;
@@ -637,8 +773,8 @@ export component MainWindow inherits Window {
                             TouchArea {
                                 mouse-cursor: self.pressed ? MouseCursor.move : MouseCursor.grab;
                                 moved => {
-                                    root.color_editor_x = clamp(root.color_editor_x + self.mouse-x - self.pressed-x, 0, canvas.width - color_editor.width);
-                                    root.color_editor_y = clamp(root.color_editor_y + self.mouse-y - self.pressed-y, 0, canvas.height - color_editor.height);
+                                    root.color_editor_state.x = clamp(root.color_editor_state.x + self.mouse-x - self.pressed-x, 0, canvas.width - color_editor.width);
+                                    root.color_editor_state.y = clamp(root.color_editor_state.y + self.mouse-y - self.pressed-y, 0, canvas.height - color_editor.height);
                                 }
                             }
                         }
@@ -649,17 +785,17 @@ export component MainWindow inherits Window {
                             spacing: 8px;
 
                             Text {
-                                text: root.color_editor_target;
+                                text: root.color_editor_state.target_name;
                                 font-size: 14pt;
                                 font-weight: FontWeight.semi-bold;
                             }
 
                             ColorEditor {
-                                initial_color: root.color_editor_color;
-                                dismiss => { root.show_color_editor = false; }
+                                initial_color: root.color_editor_state.color;
+                                dismiss => { root.color_editor_state.show = false; }
                                 submit(c) => {
-                                    root.color_editor_color = c;
-                                    root.set_color(root.color_editor_target_id, c)
+                                    root.color_editor_state.color = c;
+                                    root.set_color(root.color_editor_state.target_id, c)
                                 }
                             }
                         }
@@ -675,16 +811,37 @@ export component MainWindow inherits Window {
 
         HorizontalLayout {
             padding: 4px;
-            Text {
-                vertical-alignment: TextVerticalAlignment.center;
-                text: root.block_at_cursor.name;
+            padding-left: 8px;
+            padding-right: 8px;
+
+            HorizontalLayout {
+                min-width: 0px;
+                preferred-width: 0px;
+                horizontal-stretch: 1;
+                if (root.dimension_choice != -1): Text {
+                    horizontal-alignment: start;
+                    text: "x: \{root.world_position.block-x}, z: \{root.world_position.block_z}";
+                }
             }
 
-            Rectangle { }
+            HorizontalLayout {
+                min-width: 0px;
+                preferred-width: 0px;
+                horizontal-stretch: 1;
+                if (root.render_options.mode == slice): Text {
+                    horizontal-alignment: center;
+                    text: "slice y: \{root.render_options.height}";
+                }
+            }
 
-            Text {
-                vertical-alignment: TextVerticalAlignment.center;
-                text: root.fmt_world_position(root.world_position);
+            HorizontalLayout {
+                min-width: 0px;
+                preferred-width: 0px;
+                horizontal-stretch: 1;
+                Text {
+                    horizontal-alignment: end;
+                    text: root.block_at_cursor.name;
+                }
             }
         }
     }

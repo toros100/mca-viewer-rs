@@ -1,23 +1,24 @@
 use crate::block_map::{BlockMap, PackedBlockMap};
-use crate::draw_region::{self, DrawError};
+use crate::draw_region::{self, DrawError, HeightShadeValues};
 use crate::palette::PaletteCtx;
 use crate::region::{Region, RegionPosition, RegionRange};
 use crossbeam_channel::{Receiver, Sender, select_biased};
+use mca_tools::loader::McaLoader;
 use std::collections::HashSet;
 
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
-
-pub const TILE_SIZE: u32 = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RenderOptions {
     pub depth_darken: bool,
     pub block_map: bool,
     pub mode: RenderMode,
-    pub slice_height: u16,
+    // keeping slice height as a field rather than in the RenderMode enum to make it persistent when
+    // choosing a mode other than Slice and then going back to Slice
+    pub slice_height: i16,
 }
 
 impl Default for RenderOptions {
@@ -25,8 +26,12 @@ impl Default for RenderOptions {
         Self {
             depth_darken: true,
             block_map: true,
+
             mode: RenderMode::Normal,
-            slice_height: 127,
+
+            // ends up being sea level for overworld, spiritually sea level for the end and the midway
+            // height for the nether, seems like a reasonable default in each case
+            slice_height: 62,
         }
     }
 }
@@ -44,7 +49,7 @@ pub struct RenderTask<P> {
     options: RenderOptions,
     view: View,
     task_id: usize,
-    palette: Arc<P>,
+    palette: std::sync::Weak<P>,
 }
 
 #[derive(Debug)]
@@ -52,13 +57,19 @@ pub struct RegionTask<P> {
     region: Region,
     options: RenderOptions,
     task_id: usize,
-    palette: Arc<P>,
+    palette: Weak<P>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct View {
     pub visible: RegionRange,
     pub keep: RegionRange,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self::EMPTY
+    }
 }
 
 impl View {
@@ -84,17 +95,17 @@ impl View {
     }
 }
 
-pub struct RegionResult<P, O> {
-    task_id: usize,
+pub struct RegionResult<O> {
+    pub task_id: usize,
     pub time: Duration,
-    pub inner: Result<RegionTile<P, O>, RegionError>,
+    pub inner: Result<RegionTile<O>, RegionError>,
 }
 
-pub struct RegionTile<P, O> {
+pub struct RegionTile<O> {
     pub x: i32,
     pub z: i32,
     pub tile: O,
-    pub block_map: Option<crate::block_map::PackedBlockMap<P>>,
+    pub block_map: Option<crate::block_map::PackedBlockMap>,
 }
 
 pub struct RegionError {
@@ -103,7 +114,7 @@ pub struct RegionError {
     pub tile: DrawError,
 }
 
-impl<P, O> RegionTile<P, O> {
+impl<O> RegionTile<O> {
     pub fn pos(&self) -> RegionPosition {
         RegionPosition::new(self.x, self.z)
     }
@@ -131,13 +142,31 @@ where
     fn upload_tile(&self, data: &[u8], width: u32, height: u32) -> O;
 }
 
+// need this abstraction in mod draw_region to be able to call the functions in tests with miri.
+// can't use McaLoader, because that uses ffi calls (libdeflater)
+pub trait ChunkAccessor {
+    type Error: std::error::Error;
+    /// should return the (decompressed) chunk data for chunk idx < 1024
+    fn get_chunk_data(&mut self, idx: usize) -> Result<&[u8], Self::Error>;
+}
+
+impl ChunkAccessor for McaLoader {
+    type Error = mca_tools::loader::McaError;
+    fn get_chunk_data(&mut self, idx: usize) -> Result<&[u8], Self::Error> {
+        McaLoader::get_chunk_data(self, idx)
+    }
+}
+
 struct Worker<N, P, R, O> {
-    img: image::RgbaImage,
+    img: Box<[u8; 512 * 512 * 4]>,
+    water_img: Box<[u8; 512 * 512 * 4]>,
+    darken: Box<[u8; 512 * 512]>,
     loader: mca_tools::loader::McaLoader,
-    lookup: BlockMap,
+    block_map: BlockMap,
+    ms: HeightShadeValues,
     notify: N,
     task_rx: Receiver<RegionTask<P>>,
-    results_tx: Sender<RegionResult<P, O>>,
+    results_tx: Sender<RegionResult<O>>,
     ctx: R,
 }
 
@@ -151,63 +180,107 @@ where
     fn new(
         notify: N,
         task_rx: Receiver<RegionTask<P>>,
-        results_tx: Sender<RegionResult<P, O>>,
+        results_tx: Sender<RegionResult<O>>,
         ctx: R,
     ) -> Self {
-        let img = image::RgbaImage::new(TILE_SIZE, TILE_SIZE);
-        let loader = mca_tools::loader::McaLoader::default();
-        let lookup = BlockMap::default();
         Self {
+            darken: vec![0u8; 512 * 512].try_into().unwrap(),
+            ms: HeightShadeValues::default(),
             task_rx,
             results_tx,
             notify,
-            img,
-            loader,
-            lookup,
+            img: vec![0u8; 512 * 512 * 4].try_into().unwrap(),
+            water_img: vec![0u8; 512 * 512 * 4].try_into().unwrap(),
+            loader: mca_tools::loader::McaLoader::default(),
+            block_map: BlockMap::default(),
             ctx,
         }
     }
 
     pub fn run(&mut self) {
         while let Ok(task) = self.task_rx.recv() {
-            let res = self.render_region(task);
+            let res = self.render_region(&task);
             self.send_result(res);
         }
     }
 
-    pub fn send_result(&self, t: RegionResult<P, O>) {
+    pub fn send_result(&self, t: RegionResult<O>) {
         if self.results_tx.send(t).is_ok() {
             self.notify.notify();
         }
     }
 
-    pub fn render_region(&mut self, task: RegionTask<P>) -> RegionResult<P, O> {
+    pub fn render_region(&mut self, task: &RegionTask<P>) -> RegionResult<O> {
         let opt = task.options;
         let before = Instant::now();
+
+        let Some(ctx) = task.palette.upgrade() else {
+            return RegionResult {
+                task_id: task.task_id,
+                time: before.elapsed(),
+                inner: Err(RegionError {
+                    x: task.region.x,
+                    z: task.region.z,
+                    tile: DrawError::PaletteInvalidated,
+                }),
+            };
+        };
+
+        let f = match std::fs::File::open(&task.region.path) {
+            Ok(f) => f,
+            Err(e) => {
+                return RegionResult {
+                    task_id: task.task_id,
+                    time: before.elapsed(),
+                    inner: Err(RegionError {
+                        x: task.region.x,
+                        z: task.region.z,
+                        tile: e.into(),
+                    }),
+                };
+            }
+        };
+
+        if let Err(e) = self.loader.load_mca(f) {
+            return RegionResult {
+                task_id: task.task_id,
+                time: before.elapsed(),
+                inner: Err(RegionError {
+                    x: task.region.x,
+                    z: task.region.z,
+                    tile: e.into(),
+                }),
+            };
+        }
+
         let res = match opt.mode {
             RenderMode::Normal => draw_region::draw_region(
-                &task.region,
                 &mut self.img,
+                &mut self.water_img,
+                &mut self.ms,
+                &mut self.darken,
                 &mut self.loader,
-                &mut self.lookup,
+                &mut self.block_map,
                 opt.depth_darken,
                 opt.block_map,
-                task.palette.as_ref(),
+                &ctx,
             ),
             RenderMode::Slice => draw_region::draw_slice(
-                &task.region,
                 &mut self.img,
+                &mut self.water_img,
+                &mut self.ms,
+                &mut self.darken,
                 &mut self.loader,
-                &mut self.lookup,
+                &mut self.block_map,
                 opt.slice_height,
                 opt.depth_darken,
                 opt.block_map,
-                task.palette.as_ref(),
+                &ctx,
             ),
         };
 
         let blocks = if res.is_ok() && opt.block_map {
-            Some(PackedBlockMap::new(&self.lookup, task.palette))
+            Some(PackedBlockMap::new(&self.block_map))
         } else {
             None
         };
@@ -222,7 +295,7 @@ where
                     x: task.region.x,
                     z: task.region.z,
                     block_map: blocks,
-                    tile: self.ctx.upload_tile(&self.img, TILE_SIZE, TILE_SIZE),
+                    tile: self.ctx.upload_tile(self.img.as_slice(), 512, 512),
                 }),
                 Err(e) => Err(RegionError {
                     x: task.region.x,
@@ -238,7 +311,7 @@ pub struct Manager<N, P, R, O> {
     render_task_rx: Receiver<RenderTask<P>>,
     view_update_rx: Receiver<ViewUpdate>,
     already_rendered: HashSet<RegionPosition>,
-    results_tx: Sender<RegionResult<P, O>>,
+    results_tx: Sender<RegionResult<O>>,
     current_task: Option<RenderTask<P>>,
     regions: Vec<usize>,
     next_region: usize,
@@ -252,7 +325,7 @@ pub struct ManagerHandle<P, O> {
     render_task_tx: Sender<RenderTask<P>>,
     view_update_tx: Sender<ViewUpdate>,
     view_update_rx: Receiver<ViewUpdate>,
-    results_rx: Receiver<RegionResult<P, O>>,
+    results_rx: Receiver<RegionResult<O>>,
     task_id: usize,
 }
 
@@ -299,7 +372,7 @@ where
         (handle, manager)
     }
 
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn spawn_workers(&self, num_workers: NonZeroUsize, ctx: R) {
         for _ in 0..num_workers.get() {
             std::thread::spawn({
@@ -321,7 +394,8 @@ where
         select_biased!(
                 recv(self.render_task_rx) -> res => {
                     match res {
-                        Ok(s) => self.handle_task(s),
+                        Ok(s) =>
+                            self.handle_task(s),
                         Err(e) => {
                             eprintln!("{e:?}")
                         }
@@ -429,20 +503,19 @@ impl<P: PaletteCtx, O> ManagerHandle<P, O> {
         regions: Arc<[Region]>,
         opt: RenderOptions,
         view: View,
-        palette: Arc<P>,
-        bump_id: bool,
-    ) {
-        if bump_id {
-            self.task_id = self.task_id.wrapping_add(1);
-        }
+        palette: Weak<P>,
+    ) -> usize {
+        let task_id = self.task_id;
+        self.task_id = self.task_id.wrapping_add(1);
         let task = RenderTask {
             regions,
             options: opt,
             view,
-            task_id: self.task_id,
+            task_id,
             palette,
         };
-        self.render_task_tx.send(task).unwrap()
+        self.render_task_tx.send(task).unwrap();
+        task_id
     }
     pub fn send_view_update(&self, v: View) {
         let mut upd = ViewUpdate {
@@ -462,29 +535,74 @@ impl<P: PaletteCtx, O> ManagerHandle<P, O> {
         }
     }
 
-    pub fn recv_result(&self) -> Result<RegionResult<P, O>, crossbeam_channel::RecvError> {
-        loop {
-            match self.results_rx.recv() {
-                Ok(s) => {
-                    if s.task_id == self.task_id {
-                        break Ok(s);
-                    }
-                }
-                Err(e) => break Err(e),
-            }
-        }
+    pub fn recv_result(&self) -> Result<RegionResult<O>, crossbeam_channel::RecvError> {
+        self.results_rx.recv()
     }
 
-    pub fn try_recv_result(&self) -> Result<RegionResult<P, O>, crossbeam_channel::TryRecvError> {
-        loop {
-            match self.results_rx.try_recv() {
-                Ok(s) => {
-                    if s.task_id == self.task_id {
-                        break Ok(s);
-                    }
+    pub fn try_recv_result(&self) -> Result<RegionResult<O>, crossbeam_channel::TryRecvError> {
+        self.results_rx.try_recv()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[cfg(miri)]
+    #[test]
+    fn draw_some_chunks() {
+        // pretty untargeted and slow
+        //
+        // i guess it is still worth something that miri does not find anything wrong with all the
+        // unsafe involved
+
+        use crate::{
+            block_map::{self, BlockMap},
+            draw_region::{HeightShadeValues, draw_slice},
+            palette::DummyPalette,
+            worker::ChunkAccessor,
+        };
+        use mca_tools::loader::McaError;
+
+        const CHUNK0: &[u8] = include_bytes!("../test_data/decompressed_chunks/chunk_0.dat");
+        const CHUNK1: &[u8] = include_bytes!("../test_data/decompressed_chunks/chunk_1.dat");
+        const CHUNK2: &[u8] = include_bytes!("../test_data/decompressed_chunks/chunk_2.dat");
+        const CHUNK3: &[u8] = include_bytes!("../test_data/decompressed_chunks/chunk_3.dat");
+
+        struct PreDecompressedChunks;
+        impl ChunkAccessor for PreDecompressedChunks {
+            type Error = McaError;
+            fn get_chunk_data(&mut self, idx: usize) -> Result<&[u8], Self::Error> {
+                match idx {
+                    0 => Ok(CHUNK0),
+                    1 => Ok(CHUNK1),
+                    31 => Ok(CHUNK0),
+                    30 => Ok(CHUNK1),
+                    29 => Ok(CHUNK2),
+                    28 => Ok(&CHUNK0[..500]), // will error during deserialization
+                    27 => Ok(CHUNK3),
+                    900 => Ok(CHUNK1),
+                    _ => Err(McaError::ChunkNotFound),
                 }
-                Err(e) => break Err(e),
             }
         }
+
+        let mut img = image::RgbaImage::new(512, 512);
+        let mut block_map = BlockMap::default();
+        let mut height_shade = HeightShadeValues::default();
+        let mut darken_data = vec![0u8; 512 * 512].try_into().unwrap();
+
+        draw_slice(
+            &mut img,
+            &mut water_img,
+            &mut height_shade,
+            &mut darken_data,
+            &mut PreDecompressedChunks,
+            &mut block_map,
+            150, // above sea level, so a lot of blocks will be accessed
+            true,
+            false,
+            &DummyPalette,
+        )
+        .unwrap();
     }
 }

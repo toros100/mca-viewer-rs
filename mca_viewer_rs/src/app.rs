@@ -1,20 +1,25 @@
+mod models;
 mod slint_conv;
 mod slint_gen;
 
 use mca_viewer_rs::block_id::BlockId;
 use mca_viewer_rs::palette::{BlockPalette, PaletteCtx};
+use mca_viewer_rs::worlds_scan::{WorldInfo, scan_for_worlds};
 use slint::language::{KeyboardModifiers, PointerEventKind};
 use slint::platform::PointerEventButton;
 use slint::wgpu_30::wgpu;
+use slint_conv::ColorConv;
 use std::cell::RefMut;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::range::RangeInclusive;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::{cell::RefCell, collections::HashMap, error::Error, rc::Rc};
 use vello::kurbo;
 use vello::kurbo::Point;
 
-use slint::{ComponentHandle, ModelRc, SharedString, ToSharedString, Weak};
+use slint::{ComponentHandle, ModelRc, SharedString, ToSharedString, VecModel, Weak};
 
 use vello::kurbo::Affine;
 
@@ -22,15 +27,6 @@ use mca_viewer_rs::region::{Region, RegionPosition, RegionRange, parse_regions_i
 use mca_viewer_rs::renderer::{GpuTile, Renderer};
 use mca_viewer_rs::worker::{self};
 use mca_viewer_rs::worker::{ManagerHandle, RegionTile, RenderMode, RenderOptions, View};
-
-#[derive(Clone)]
-pub struct PaletteEntry {
-    id: BlockId,
-    name: SharedString,
-    new_color: slint::Color,
-    color: slint::Color,
-    is_mapped: bool,
-}
 
 #[derive(Clone)]
 pub struct NotifyApp {
@@ -58,6 +54,7 @@ impl NotifyApp {
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
             _ = self.window.upgrade_in_event_loop(|w| {
+                w.window().request_redraw();
                 w.global::<slint_gen::Notify>().invoke_notify();
             });
         }
@@ -70,6 +67,7 @@ impl NotifyApp {
 }
 
 pub struct AppHandle {
+    #[expect(unused)]
     app: Rc<RefCell<App>>,
     window: slint_gen::MainWindow,
 }
@@ -79,6 +77,7 @@ impl AppHandle {
         Ok(self.window.run()?)
     }
 
+    #[expect(unused)]
     pub fn borrow_mut(&self) -> RefMut<'_, App> {
         self.app.borrow_mut()
     }
@@ -94,184 +93,106 @@ pub fn new(num_workers: NonZeroUsize, palette: Arc<BlockPalette>) -> anyhow::Res
     Ok(AppHandle { app, window })
 }
 
-#[derive(Default)]
-struct BlockFilter {
-    group: slint_gen::FilterGroup,
-    status: slint_gen::FilterStatus,
-    matcher: nucleo_matcher::Matcher,
-    pattern: nucleo_matcher::pattern::Pattern,
-    scratch: Vec<char>,
-}
-
-impl BlockFilter {
-    fn set_pattern(&mut self, p: &str) {
-        self.pattern = nucleo_matcher::pattern::Pattern::new(
-            p,
-            nucleo_matcher::pattern::CaseMatching::Ignore,
-            nucleo_matcher::pattern::Normalization::Never,
-            nucleo_matcher::pattern::AtomKind::Fuzzy,
-        );
-    }
-
-    fn set_filter_group(&mut self, f: slint_gen::FilterGroup) {
-        self.group = f;
-    }
-
-    fn set_filter_status(&mut self, s: slint_gen::FilterStatus) {
-        self.status = s;
-    }
-
-    fn score(&mut self, e: &PaletteEntry) -> Option<u32> {
-        match self.group {
-            slint_gen::FilterGroup::Unmapped if e.is_mapped => return None,
-            slint_gen::FilterGroup::Mapped if !e.is_mapped => return None,
-            _ => {}
-        }
-
-        match self.status {
-            slint_gen::FilterStatus::Modified if e.color == e.new_color => return None,
-            slint_gen::FilterStatus::Unmodified if e.color != e.new_color => return None,
-            _ => {}
-        }
-
-        self.pattern.score(
-            nucleo_matcher::Utf32Str::new(&e.name, &mut self.scratch),
-            &mut self.matcher,
-        )
-    }
+pub struct TileWithId {
+    tile: RegionTile<GpuTile>,
+    task_id: usize,
 }
 
 pub struct App {
     self_ref: std::rc::Weak<RefCell<Self>>,
     renderer: Option<Renderer>,
     window: Weak<slint_gen::MainWindow>,
-    tiles: HashMap<RegionPosition, RegionTile<BlockPalette, GpuTile>>,
-    render_options: RenderOptions,
+    tiles: HashMap<RegionPosition, TileWithId>,
     overlay_scene: vello::Scene,
     canvas_dims: (f32, f32),
-    view_affine: kurbo::Affine,
     pan_enter: Option<kurbo::Point>,
     handle: Option<ManagerHandle<BlockPalette, GpuTile>>,
-    view: View,
     notify: NotifyApp,
-    regions: Arc<[Region]>,
+    active_world: Option<World>,
     palette: Arc<BlockPalette>,
     num_workers: NonZeroUsize,
     needs_redraw: bool,
     show_region_grid: bool,
-    min_scale_pow: i8,
-    curr_scale_pow: i8,
-    max_scale_pow: i8,
-    palette_model: Rc<PaletteModel>,
+    palette_model: Rc<models::PaletteModel>,
+    worlds_model: Rc<models::WorldsModel>,
+    dimensions_model: Rc<VecModel<SharedString>>,
+    world_fd_open: bool,
 }
 
-#[derive(Default)]
-struct PaletteModelInner {
-    filter: BlockFilter,
-    entries: Vec<PaletteEntry>,
-    indices: Vec<EntryRef>,
+pub struct Dimension {
+    pub name: SharedString,
+    pub y_range: std::range::RangeInclusive<i16>,
+    pub opt: RenderOptions,
+    pub regions: Arc<[Region]>,
+    pub view_state: ViewState,
 }
 
-#[derive(Default)]
-struct PaletteModel {
-    inner: RefCell<PaletteModelInner>,
-
-    // TODO: currently just calling notify.reset() on any change, could do dirty tracking
-    notify: slint::ModelNotify,
+#[derive(Clone, Copy)]
+pub struct ViewState {
+    pub min_scale_pow: i8,
+    pub curr_scale_pow: i8,
+    pub max_scale_pow: i8,
+    pub affine: kurbo::Affine,
+    pub view: View,
 }
 
-struct EntryRef {
-    idx: usize,
-    score: u32,
-}
-
-impl PaletteModelInner {
-    fn load(&mut self, it: impl Iterator<Item = PaletteEntry>) {
-        let n = self.entries.len();
-        for entry in it {
-            if self.entries[..n]
-                .binary_search_by_key(&entry.id, |e| e.id)
-                .is_err()
-            {
-                self.entries.push(entry)
-            }
-        }
-        self.entries.sort_by_key(|e| e.id);
-        self.rescore();
+impl ViewState {
+    fn screen_to_world(&self, x: f32, y: f32) -> kurbo::Point {
+        let screen_pos = kurbo::Point::from((x, y));
+        self.affine.inverse() * screen_pos
     }
 
-    fn discard_changes(&mut self) {
-        for entry in self.entries.iter_mut() {
-            entry.new_color = entry.color
-        }
-        self.rescore();
+    fn current_scale(&self) -> f64 {
+        // WARN: only works because i only use scaling and translation
+        let coeffs = self.affine.as_coeffs();
+        let xs = coeffs[0];
+        let ys = coeffs[3];
+        debug_assert_eq!(xs, ys);
+        xs
     }
 
-    fn set_color(&mut self, id: BlockId, col: slint::Color) {
-        if let Ok(idx) = self.entries.binary_search_by_key(&id, |e| e.id) {
-            self.entries[idx].new_color = col;
-        }
-        self.rescore();
-    }
+    fn set_scale(&mut self, pow: i8, fixed_screen_point: kurbo::Point) -> bool {
+        let p = pow.clamp(self.min_scale_pow, self.max_scale_pow);
 
-    fn reset_color(&mut self, id: BlockId) {
-        if let Ok(idx) = self.entries.binary_search_by_key(&id, |e| e.id) {
-            self.entries[idx].new_color = self.entries[idx].color;
-        }
-        self.rescore();
-    }
-
-    fn set_pattern(&mut self, s: &str) {
-        self.filter.set_pattern(s);
-        self.rescore();
-    }
-
-    fn set_filter_group(&mut self, g: slint_gen::FilterGroup) {
-        self.filter.set_filter_group(g);
-        self.rescore();
-    }
-
-    fn set_filter_status(&mut self, s: slint_gen::FilterStatus) {
-        self.filter.set_filter_status(s);
-        self.rescore();
-    }
-
-    fn rescore(&mut self) {
-        self.indices.clear();
-        for (idx, e) in self.entries.iter_mut().enumerate() {
-            let score = self.filter.score(e);
-            if let Some(score) = score {
-                self.indices.push(EntryRef { idx, score })
-            }
+        if self.curr_scale_pow == p {
+            return false;
         }
 
-        self.indices
-            .sort_by(|r1, r2| r2.score.cmp(&r1.score).then(r2.idx.cmp(&r1.idx)));
+        self.curr_scale_pow = p;
+
+        let f = 2f64.powi(p as i32);
+
+        let cs = self.current_scale();
+        self.affine = self.affine.then_scale_about(1. / cs, fixed_screen_point);
+        self.affine = self.affine.then_scale_about(f, fixed_screen_point);
+        true
     }
 }
 
-impl slint::Model for PaletteModel {
-    type Data = slint_gen::PaletteEntry;
-    fn row_count(&self) -> usize {
-        self.inner.borrow().indices.len()
+impl Default for ViewState {
+    fn default() -> Self {
+        Self {
+            min_scale_pow: -4,
+            max_scale_pow: 8,
+            curr_scale_pow: 0,
+            affine: Affine::IDENTITY,
+            view: View::EMPTY,
+        }
     }
-    fn row_data(&self, row: usize) -> Option<Self::Data> {
-        let inner = self.inner.borrow();
-        inner.indices.get(row).map(|i| {
-            let e = &inner.entries[i.idx];
+}
 
-            slint_gen::PaletteEntry {
-                color: e.new_color,
-                id: (u16::from(e.id) as i32),
-                name: e.name.clone(),
-                is_dirty: e.new_color != e.color,
-                is_mapped: e.is_mapped,
-            }
-        })
+pub struct World {
+    #[expect(unused)]
+    pub info: WorldInfo,
+    pub dimensions: Vec<Dimension>,
+    pub active_dimension_idx: Option<usize>,
+}
+impl World {
+    fn active_dimension(&self) -> Option<&Dimension> {
+        self.dimensions.get(self.active_dimension_idx?)
     }
-
-    fn model_tracker(&self) -> &dyn slint::ModelTracker {
-        &self.notify
+    fn active_dimension_mut(&mut self) -> Option<&mut Dimension> {
+        self.dimensions.get_mut(self.active_dimension_idx?)
     }
 }
 
@@ -288,85 +209,105 @@ impl App {
                 self_ref: e.clone(),
                 num_workers,
                 renderer: None,
-                render_options: RenderOptions::default(),
-                regions: Arc::default(),
-                view: View::EMPTY,
                 handle: None,
                 window: window.as_weak(),
                 tiles: HashMap::default(),
                 overlay_scene: vello::Scene::default(),
                 canvas_dims: (1., 1.),
-                view_affine: Affine::IDENTITY,
                 pan_enter: None,
                 notify,
                 needs_redraw: true,
                 show_region_grid: false,
-                min_scale_pow: -4,
-                max_scale_pow: 8,
-                curr_scale_pow: 0,
                 palette_model: Default::default(),
+                worlds_model: Default::default(),
+                dimensions_model: Default::default(),
+                active_world: None,
+                world_fd_open: false,
             })
         });
         app.borrow_mut().load_palette_model();
+        app.borrow_mut()
+            .set_worlds_directory("/home/tobias/.minecraft/".into());
         app
     }
     fn load_palette_model(&mut self) {
-        self.palette_model
-            .inner
-            .borrow_mut()
-            .load(
-                self.palette
-                    .iter_entries()
-                    .map(|(id, name, col, is_mapped)| {
-                        let color = slint::Color::from_rgb_u8(col[0], col[1], col[2]);
-                        // HACK: not nice
-                        PaletteEntry {
-                            id,
-                            name: String::from_utf8_lossy(name).to_shared_string(),
-                            color,
-                            new_color: color,
-                            is_mapped,
-                        }
-                    }),
-            );
+        self.palette_model.load(
+            self.palette
+                .iter_entries()
+                .map(|(id, name, col, is_mapped)| {
+                    let color = slint::Color::from_rgb_u8(col[0], col[1], col[2]);
+                    // HACK: not nice
+                    models::PaletteEntry {
+                        id,
+                        name: String::from_utf8_lossy(name).to_shared_string(),
+                        color,
+                        new_color: color,
+                        is_mapped,
+                    }
+                }),
+        );
     }
 
     fn fix_palette(&mut self) {
-        let mut pal = self.palette.deep_clone();
-        pal.fix();
-        self.palette = Arc::new(pal);
+        // using Arc::make_mut to try to skip a deep clone on self.palette
+        //
+        // the worker threads only get Weak<BlockPalette> and try to upgrade it before actually
+        // drawing a region, so if everything is "at rest", the wrong count will always be 1 and we
+        // will be able to mutate the palette without the deep clone
+        //
+        // when this is hit while a worker does have a strong reference, Arc::make_mut will clone
+        // the BlockPalette to a new allocation
+        //
+        // WARN: this can block because the impl of Clone on BlockPalette requires a read lock,
+        // but that should be pretty rare and brief (will block only if a worker has a write
+        // lock, which only happens when a previously unknown block identifier &[u8] is encountered
+        // and interned)
+        //
+        let p = Arc::make_mut(&mut self.palette);
+        p.fix();
         self.load_palette_model();
         self.rerender(false);
     }
 
     pub fn update_render_options(&mut self, opt: RenderOptions) {
-        if opt == self.render_options {
+        let Some(dim) = self
+            .active_world
+            .as_mut()
+            .and_then(World::active_dimension_mut)
+        else {
             return;
         };
 
-        self.render_options = opt;
-        if self.regions.is_empty() {
+        if opt == dim.opt {
             return;
         };
 
-        self.send_task(false);
+        dim.opt = opt;
+
+        self.send_task();
+
         if let Some(w) = self.window.upgrade() {
             w.set_render_options(slint_gen::RenderOptions::from(opt));
         }
     }
 
-    fn send_task(&mut self, bump_id: bool) {
+    fn send_task(&mut self) {
         let Some(handle) = self.handle.as_mut() else {
             return;
         };
 
-        handle.send_task(
-            self.regions.clone(),
-            self.render_options,
-            self.view,
-            self.palette.clone(),
-            bump_id,
-        );
+        if let Some(w) = self.active_world.as_ref()
+            && let Some(d) = w.active_dimension()
+        {
+            let regions = d.regions.clone();
+
+            handle.send_task(
+                regions,
+                d.opt,
+                d.view_state.view,
+                Arc::downgrade(&self.palette),
+            );
+        }
     }
 
     pub fn handle_notification(&mut self) {
@@ -376,16 +317,149 @@ impl App {
 
         self.notify.clear();
 
+        let Some(d) = self.active_world.as_ref().and_then(World::active_dimension) else {
+            // if no dimension set, any incoming thing is stale garbage
+            // still has to be drained
+            while handle.try_recv_result().is_ok() {}
+            return;
+        };
+
         while let Ok(r) = handle.try_recv_result() {
             if let Ok(s) = r.inner
-                && self.view.keep.contains(s.pos())
+                && d.view_state.view.keep.contains(s.pos())
             {
-                self.tiles.insert(s.pos(), s);
-                self.needs_redraw = true;
-                if let Some(w) = self.window.upgrade() {
+                if let Some(t) = self.tiles.get_mut(&s.pos()) {
+                    if r.task_id == t.task_id {}
+                    if t.task_id < r.task_id {
+                        t.task_id = r.task_id;
+                        t.tile = s;
+                        self.needs_redraw = true
+                    }
+                } else {
+                    self.tiles.insert(
+                        s.pos(),
+                        TileWithId {
+                            tile: s,
+                            task_id: r.task_id,
+                        },
+                    );
+                    self.needs_redraw = true;
+                }
+
+                if self.needs_redraw
+                    && let Some(w) = self.window.upgrade()
+                {
                     w.window().request_redraw();
                 }
             }
+        }
+    }
+
+    fn select_world(&mut self, w: WorldInfo) {
+        let mut dims = vec![];
+
+        // (x=0, z=0) at screen center
+        let affine = Affine::translate((
+            (self.canvas_dims.0 / 2.) as f64,
+            (self.canvas_dims.1 / 2.) as f64,
+        ));
+
+        if let Some(r) = w.overworld_regions.clone()
+            && let Ok(it) = parse_regions_in_dir(&r.path)
+        {
+            dims.push(Dimension {
+                regions: it.collect(),
+                name: "Overworld".into(),
+                view_state: ViewState {
+                    affine,
+                    ..Default::default()
+                },
+                y_range: RangeInclusive {
+                    start: -64,
+                    last: 384,
+                },
+                opt: RenderOptions::default(),
+            });
+        };
+
+        if let Some(r) = w.nether_regions.clone()
+            && let Ok(it) = parse_regions_in_dir(&r.path)
+        {
+            dims.push(Dimension {
+                regions: it.collect(),
+                // NOTE: "normal" mode in nether just shows the roof, probably not what you want
+                opt: RenderOptions {
+                    mode: RenderMode::Slice,
+                    ..Default::default()
+                },
+                name: "The Nether".into(),
+                y_range: RangeInclusive {
+                    start: 0,
+                    last: 127,
+                },
+                view_state: ViewState {
+                    affine,
+                    ..Default::default()
+                },
+            });
+        };
+
+        if let Some(r) = w.end_regions.clone()
+            && let Ok(it) = parse_regions_in_dir(&r.path)
+        {
+            dims.push(Dimension {
+                regions: it.collect(),
+                view_state: ViewState {
+                    affine,
+                    ..Default::default()
+                },
+                name: "The End".into(),
+                y_range: RangeInclusive {
+                    start: 0,
+                    last: 127,
+                },
+                opt: RenderOptions::default(),
+            });
+        };
+
+        self.dimensions_model.clear();
+        for d in dims.iter() {
+            self.dimensions_model.push(d.name.clone());
+        }
+
+        let dim_idx = if !dims.is_empty() { 0 } else { -1 };
+
+        let wo = World {
+            info: w,
+            active_dimension_idx: None,
+            dimensions: dims,
+        };
+
+        self.active_world = Some(wo);
+        self.select_dimension(dim_idx);
+    }
+
+    fn select_dimension(&mut self, i: i32) {
+        let Some(win) = self.window.upgrade() else {
+            return;
+        };
+
+        if let Some(w) = self.active_world.as_mut() {
+            if i >= 0 && (i as usize) < w.dimensions.len() {
+                w.active_dimension_idx = Some(i as usize);
+                let d = &w.dimensions[i as usize];
+                win.set_render_options(d.opt.into());
+                win.set_dimension_choice(i);
+                win.set_y_range(slint_gen::YRange {
+                    max: d.y_range.last as i32,
+                    min: d.y_range.start as i32,
+                });
+            } else {
+                w.active_dimension_idx = None;
+                win.set_dimension_choice(-1);
+            }
+            self.update_view(true);
+            self.rerender(true);
         }
     }
 
@@ -415,9 +489,10 @@ impl App {
         };
 
         if let Some(t) = self.tiles.get(&RegionPosition::new(region_x, region_z))
-            && let Some(b) = &t.block_map
+            && let Some(b) = &t.tile.block_map
         {
-            let (id, bs) = b.get(block_x_in_region as usize, block_z_in_region as usize);
+            let id = b.get(block_x_in_region as usize, block_z_in_region as usize);
+            let bs = self.palette.get_block_name(id);
 
             let has_color = self.palette.has_color(id);
 
@@ -451,32 +526,40 @@ impl App {
         window.set_world_position(pos);
     }
 
-    fn screen_to_world(&self, x: f32, y: f32) -> kurbo::Point {
-        let screen_pos = kurbo::Point::from((x, y));
-        self.view_affine.inverse() * screen_pos
+    fn center_at(&mut self, world_position: kurbo::Point) {
+        if let Some(d) = self
+            .active_world
+            .as_mut()
+            .and_then(World::active_dimension_mut)
+            .map(|d| &mut d.view_state)
+        {
+            let p = d.screen_to_world(self.canvas_dims.0 / 2., self.canvas_dims.1 / 2.);
+            d.affine = d.affine.pre_translate(p - world_position);
+        }
     }
 
-    fn current_scale(&self) -> f64 {
-        // WARN: only works because
-        let coeffs = self.view_affine.as_coeffs();
-        let xs = coeffs[0];
-        let ys = coeffs[3];
-        debug_assert_eq!(xs, ys);
-        xs
-    }
-
-    fn update_view(&mut self) {
+    fn update_view(&mut self, send_update: bool) {
         let Some(handle) = self.handle.as_ref() else {
+            return;
+        };
+
+        let Some(vs) = self
+            .active_world
+            .as_mut()
+            .and_then(World::active_dimension_mut)
+            .map(|d| &mut d.view_state)
+        else {
             return;
         };
 
         let half_width = self.canvas_dims.0 / 2.;
         let half_height = self.canvas_dims.1 / 2.;
-        let screen_center_world = self.screen_to_world(half_width, half_height);
+
+        let screen_center_world = vs.screen_to_world(half_width, half_height);
         let screen_center_region_x = (screen_center_world.x.floor() as i32).div_euclid(512);
         let screen_center_region_z = (screen_center_world.y.floor() as i32).div_euclid(512);
 
-        let tile_size_world = 512. * self.current_scale();
+        let tile_size_world = 512. * vs.current_scale();
 
         let x_fit = (half_width as f64 / tile_size_world).ceil();
         let z_fit = (half_height as f64 / tile_size_world).ceil();
@@ -490,14 +573,25 @@ impl App {
 
         self.needs_redraw = true;
 
-        if v != self.view {
-            self.view = v;
-            handle.send_view_update(v);
-            self.tiles.retain(|pos, _| self.view.keep.contains(*pos));
+        if v != vs.view {
+            vs.view = v;
+            if send_update {
+                handle.send_view_update(v);
+            }
+            self.tiles.retain(|pos, _| vs.view.keep.contains(*pos));
         }
         if let Some(w) = self.window.upgrade() {
             w.window().request_redraw();
         }
+    }
+
+    fn set_color(&mut self, id: BlockId, color: slint::Color) {
+        // WARN: see comment in App::fix_palette
+        let pal = Arc::make_mut(&mut self.palette);
+        self.palette_model.set_color_if_id_present(id, color);
+        pal.set_color_if_id_present(id, color.conv_into());
+        self.palette_model.notify_all();
+        self.rerender(false);
     }
 
     fn handle_pointer_event(
@@ -508,8 +602,17 @@ impl App {
         x: f32,
         y: f32,
     ) {
+        let Some(vs) = self
+            .active_world
+            .as_ref()
+            .and_then(World::active_dimension)
+            .map(|d| d.view_state)
+        else {
+            return;
+        };
+
         let screen_pos = kurbo::Point::from((x, y));
-        let world_pos = self.screen_to_world(x, y);
+        let world_pos = vs.screen_to_world(x, y);
 
         self.set_world_position(world_pos);
 
@@ -519,10 +622,21 @@ impl App {
             }
 
             (_, PointerEventKind::Move) if let Some(pan_enter_screen_pos) = self.pan_enter => {
-                let diff = screen_pos - pan_enter_screen_pos;
-                self.view_affine = self.view_affine.then_translate(diff);
-                self.update_view();
-                self.pan_enter = Some(screen_pos);
+                if let Some(dim) = self
+                    .active_world
+                    .as_mut()
+                    .and_then(World::active_dimension_mut)
+                {
+                    // NOTE: slightly ugly to have the pan enter live in App but apply to whichever
+                    // dimension is active, but letting each dimension have its own pan enter is probably
+                    // overkill
+
+                    let diff = screen_pos - pan_enter_screen_pos;
+                    dim.view_state.affine = dim.view_state.affine.then_translate(diff);
+
+                    self.update_view(true);
+                    self.pan_enter = Some(screen_pos);
+                }
             }
 
             (_, PointerEventKind::Up | PointerEventKind::Cancel) => {
@@ -538,6 +652,11 @@ impl App {
             return None;
         }
 
+        let Some(dim) = self.active_world.as_ref().and_then(World::active_dimension) else {
+            self.needs_redraw = false;
+            return None;
+        };
+
         let r = self.renderer.as_mut()?;
 
         let (w, h, s) = {
@@ -549,8 +668,8 @@ impl App {
             )
         };
 
-        let rounded_translation = self.view_affine.translation().round();
-        let rounded_affine = self.view_affine.with_translation(rounded_translation);
+        let rounded_translation = dim.view_state.affine.translation().round();
+        let rounded_affine = dim.view_state.affine.with_translation(rounded_translation);
 
         // NOTE:
         // could prepare scene in world coordinates, then pass the affine into self.renderer.render
@@ -563,8 +682,8 @@ impl App {
 
         if self.show_region_grid {
             for pos in self.tiles.keys() {
-                if self.view.visible.contains(*pos) {
-                    if self.curr_scale_pow > -2 {
+                if dim.view_state.view.visible.contains(*pos) {
+                    if dim.view_state.curr_scale_pow > -2 {
                         for chunk_x in 0..32 {
                             for chunk_z in 0..32 {
                                 let x_off = (chunk_x * 16) as f64;
@@ -618,9 +737,12 @@ impl App {
         }
 
         let tex = r.render(
-            self.tiles
-                .iter()
-                .map(|(pos, tile)| (rounded_affine.transform_rect_bbox(pos.rect()), &tile.tile)),
+            self.tiles.iter().map(|(pos, tile)| {
+                (
+                    rounded_affine.transform_rect_bbox(pos.rect()),
+                    &tile.tile.tile,
+                )
+            }),
             &self.overlay_scene,
             w,
             h,
@@ -648,81 +770,98 @@ impl App {
             manager.run();
         });
 
-        self.update_view();
-        if !self.regions.is_empty() {
-            self.send_task(false);
-        }
-
         Ok(())
     }
 
     fn set_scale(&mut self, pow: i8, fixed_screen_point: Point) {
-        debug_assert!(self.min_scale_pow < self.max_scale_pow);
-
-        let p = pow.clamp(self.min_scale_pow, self.max_scale_pow);
-
-        if self.curr_scale_pow == p {
+        let Some(vs) = self
+            .active_world
+            .as_mut()
+            .and_then(World::active_dimension_mut)
+            .map(|d| &mut d.view_state)
+        else {
             return;
-        }
+        };
 
-        self.curr_scale_pow = p;
+        if !vs.set_scale(pow, fixed_screen_point) {
+            return;
+        };
 
-        let f = 2f64.powi(p as i32);
-
-        let cs = self.current_scale();
-        self.view_affine = self
-            .view_affine
-            .then_scale_about(1. / cs, fixed_screen_point);
-        self.view_affine = self.view_affine.then_scale_about(f, fixed_screen_point);
-        self.update_view();
+        self.update_view(true);
 
         if let Some(w) = self.window.upgrade() {
             w.window().request_redraw();
         }
     }
 
-    fn rerender(&mut self, bump_id: bool) {
-        println!("rendering {} regions", self.regions.len());
-        if bump_id {
+    fn rerender(&mut self, clear: bool) {
+        let Some(w) = self.window.upgrade() else {
+            return;
+        };
+        if clear {
             self.tiles.clear();
         }
-        self.send_task(bump_id);
+        self.needs_redraw = true;
+        self.send_task();
+        w.window().request_redraw();
     }
 
     fn increase_scale(&mut self, fixed_screen_point: Point) {
-        self.set_scale(self.curr_scale_pow + 1, fixed_screen_point);
+        let Some(curr_scale_pow) = self
+            .active_world
+            .as_ref()
+            .and_then(World::active_dimension)
+            .map(|d| d.view_state.curr_scale_pow)
+        else {
+            return;
+        };
+
+        self.set_scale(curr_scale_pow.saturating_add(1), fixed_screen_point);
     }
 
     fn decrease_scale(&mut self, fixed_screen_point: Point) {
-        self.set_scale(self.curr_scale_pow - 1, fixed_screen_point);
-    }
+        let Some(curr_scale_pow) = self
+            .active_world
+            .as_ref()
+            .and_then(World::active_dimension)
+            .map(|d| d.view_state.curr_scale_pow)
+        else {
+            return;
+        };
 
-    pub fn load_dir(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
-        let rs = parse_regions_in_dir(path)?;
-        let regions = Arc::from_iter(rs.into_iter().map(|r| Region {
-            x: r.x,
-            z: r.z,
-            path: r.path,
-        }));
-
-        self.regions = regions;
-
-        Ok(())
+        self.set_scale(curr_scale_pow.saturating_sub(1), fixed_screen_point);
     }
 
     fn reset_scale(&mut self) {
-        self.view_affine = Affine::scale(1.).then_translate(self.view_affine.translation());
-        self.update_view();
+        let Some(vs) = self
+            .active_world
+            .as_mut()
+            .and_then(World::active_dimension_mut)
+            .map(|d| &mut d.view_state)
+        else {
+            return;
+        };
+
+        vs.affine = Affine::scale(1.).then_translate(vs.affine.translation());
+
+        self.update_view(true);
         if let Some(w) = self.window.upgrade() {
             w.window().request_redraw();
         }
+    }
+
+    fn set_worlds_directory(&mut self, path: PathBuf) {
+        let ws = scan_for_worlds(path, 3);
+
+        println!("found {} worlds", ws.len());
+
+        self.worlds_model.load(ws);
+        self.worlds_model.notify_all();
     }
 
     pub fn register_callbacks(&self) -> anyhow::Result<()> {
         let window = self.window.unwrap();
         let app = self.self_ref.upgrade().unwrap();
-
-        window.set_render_options(app.borrow().render_options.into());
 
         let notify = window.global::<slint_gen::Notify>();
         notify.on_notify({
@@ -743,8 +882,10 @@ impl App {
             let app = app.clone();
             move |w, h| {
                 let mut app = app.borrow_mut();
-                app.canvas_dims = (w, h);
-                app.update_view();
+                if app.canvas_dims != (w, h) {
+                    app.canvas_dims = (w, h);
+                    app.update_view(true);
+                }
             }
         });
 
@@ -763,17 +904,43 @@ impl App {
             }
         });
 
+        window.on_set_slice_height({
+            let app = app.clone();
+            move |h| {
+                let mut app = app.borrow_mut();
+
+                let Some(dim) = app.active_world.as_ref().and_then(World::active_dimension) else {
+                    return;
+                };
+
+                let mut opt = dim.opt;
+
+                if opt.mode == RenderMode::Slice {
+                    opt.slice_height =
+                        h.clamp(dim.y_range.start as i32, dim.y_range.last as i32) as i16;
+                } else {
+                    return;
+                }
+                app.update_render_options(opt);
+            }
+        });
+
         window.on_change_slice_height({
             let app = app.clone();
 
             move |e| {
                 let mut app = app.borrow_mut();
 
-                let mut opt = app.render_options;
+                let Some(dim) = app.active_world.as_ref().and_then(World::active_dimension) else {
+                    return;
+                };
 
-                if app.render_options.mode == RenderMode::Slice {
-                    opt.slice_height =
-                        (opt.slice_height as i32 + e).clamp(0, u16::MAX as i32) as u16;
+                let mut opt = dim.opt;
+
+                if opt.mode == RenderMode::Slice {
+                    opt.slice_height = ((opt.slice_height as i32).saturating_add(e))
+                        .clamp(dim.y_range.start as i32, dim.y_range.last as i32)
+                        as i16;
                 } else {
                     return;
                 }
@@ -838,51 +1005,22 @@ impl App {
         window.on_set_color({
             let app = app.clone();
             move |id, c| {
-                // TODO: kind of annoying to deep clone the palette for every single color change
-                //
-                // could batch changes first, e.g. have a working copy (already have a slint
-                // model), changes are written to that, and then separately committed to the real
-                // palette with a single deep clone
-
                 let id = if id <= 1 || id >= u16::MAX as i32 {
                     return;
                 } else {
                     BlockId::from(id as u16)
                 };
 
-                let app = app.borrow_mut();
-
-                app.palette_model.inner.borrow_mut().set_color(id, c);
-                app.palette_model.notify.reset();
+                app.borrow_mut().set_color(id, c);
             }
         });
 
+        // TODO: this should be "save palette" (and offer a way to save to file)
         window.on_apply_palette({
             let app = app.clone();
             move || {
-                let new_palette = {
-                    let app = app.borrow();
-                    let mut p = app.palette.deep_clone();
-                    let mut pp = app.palette_model.inner.borrow_mut();
-                    for e in pp.entries.iter_mut() {
-                        if e.color != e.new_color {
-                            let c = [
-                                e.new_color.red(),
-                                e.new_color.green(),
-                                e.new_color.blue(),
-                                255,
-                            ];
-                            p.set_color(e.id, c);
-                            e.color = e.new_color;
-                            e.is_mapped = true;
-                        }
-                    }
-                    p.fix();
-                    p
-                };
-                app.borrow_mut().palette = Arc::new(new_palette);
-                app.borrow_mut().rerender(false);
-                app.borrow().palette_model.notify.reset();
+                app.borrow_mut().palette_model.apply_changes(|_, _| {});
+                app.borrow().palette_model.notify_all();
             }
         });
 
@@ -895,10 +1033,12 @@ impl App {
                     BlockId::from(id as u16)
                 };
 
-                let app = app.borrow_mut();
+                let mut app = app.borrow_mut();
 
-                app.palette_model.inner.borrow_mut().reset_color(id);
-                app.palette_model.notify.reset();
+                if let Some(c) = app.palette_model.reset_color(id) {
+                    app.set_color(id, c);
+                    app.palette_model.notify_all();
+                }
             }
         });
 
@@ -906,8 +1046,8 @@ impl App {
             let app = app.clone();
             move |s| {
                 let app = app.borrow();
-                app.palette_model.inner.borrow_mut().set_pattern(&s);
-                app.palette_model.notify.reset();
+                app.palette_model.set_pattern(&s);
+                app.palette_model.notify_all();
             }
         });
 
@@ -917,34 +1057,52 @@ impl App {
                 app.borrow_mut().fix_palette();
 
                 let app = app.borrow();
-                app.palette_model
-                    .inner
-                    .borrow_mut()
-                    .load(app.palette.iter_entries().map(|(id, name, c, is_mapped)| {
-                        let color = slint::Color::from_rgb_u8(c[0], c[1], c[2]);
+                app.palette_model.load(app.palette.iter_entries().map(
+                    |(id, name, c, is_mapped)| {
+                        let color = c.conv_into();
                         let name = String::from_utf8_lossy(name).to_shared_string();
-                        PaletteEntry {
+                        models::PaletteEntry {
                             id,
                             name,
                             new_color: color,
                             color,
                             is_mapped,
                         }
-                    }));
+                    },
+                ));
 
-                app.palette_model.notify.reset();
+                app.palette_model.notify_all();
             }
         });
 
         window.set_palette(ModelRc::new(self.palette_model.clone()));
+        window.set_worlds(ModelRc::new(self.worlds_model.clone()));
+
+        window.on_select_world({
+            let app = app.clone();
+            move |i| {
+                if i < 0 {
+                    return;
+                }
+                let i = i as usize;
+
+                let mut app = app.borrow_mut();
+
+                let Some(world) = app.worlds_model.get(i) else {
+                    return;
+                };
+
+                app.select_world(world);
+                app.rerender(true);
+            }
+        });
 
         window.on_set_filter_group({
             let app = app.clone();
             move |f| {
                 let app = app.borrow();
-                app.palette_model.inner.borrow_mut().set_filter_group(f);
-
-                app.palette_model.notify.reset();
+                app.palette_model.set_filter_group(f);
+                app.palette_model.notify_all();
             }
         });
 
@@ -952,8 +1110,8 @@ impl App {
             let app = app.clone();
             move |s| {
                 let app = app.borrow();
-                app.palette_model.inner.borrow_mut().set_filter_status(s);
-                app.palette_model.notify.reset();
+                app.palette_model.set_filter_status(s);
+                app.palette_model.notify_all();
             }
         });
 
@@ -961,8 +1119,65 @@ impl App {
             let app = app.clone();
             move || {
                 let app = app.borrow();
-                app.palette_model.inner.borrow_mut().discard_changes();
-                app.palette_model.notify.reset();
+                app.palette_model.discard_changes();
+                app.palette_model.notify_all();
+            }
+        });
+
+        window.on_pick_dir({
+            let app = app.clone();
+            let window = window.as_weak();
+            move || {
+                let app = app.clone();
+                {
+                    let mut app = app.borrow_mut();
+                    if app.world_fd_open {
+                        return;
+                    }
+                    app.world_fd_open = true;
+                }
+
+                slint::spawn_local({
+                    let app = app.clone();
+                    let window = window.clone();
+                    async move {
+                        let Some(window_handle) =
+                            window.upgrade().map(|w| w.window().window_handle())
+                        else {
+                            return;
+                        };
+                        let res = rfd::AsyncFileDialog::new()
+                            .set_parent(&window_handle)
+                            .pick_folder()
+                            .await;
+
+                        let mut app = app.borrow_mut();
+                        app.world_fd_open = false;
+
+                        let Some(h) = res else { return };
+
+                        let path = h.path().to_owned();
+                        app.set_worlds_directory(path);
+                    }
+                })
+                .unwrap();
+            }
+        });
+
+        window.set_dimensions(ModelRc::new(self.dimensions_model.clone()));
+
+        window.on_select_dimension({
+            let app = app.clone();
+            move |i| {
+                app.borrow_mut().select_dimension(i);
+            }
+        });
+
+        window.on_center_origin({
+            let app = app.clone();
+            move || {
+                app.borrow_mut().center_at((0., 0.).into());
+                app.borrow_mut().update_view(true);
             }
         });
 

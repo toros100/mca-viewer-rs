@@ -25,7 +25,7 @@ struct Args {
     repeat: NonZeroUsize,
 
     #[arg(long, short)]
-    slice_height: Option<u16>,
+    slice_height: Option<i16>,
 }
 
 #[derive(Clone)]
@@ -95,9 +95,11 @@ fn main() -> anyhow::Result<()> {
 
     let mut timings = Vec::with_capacity(regions.len());
 
+    let w = Arc::downgrade(&palette);
+
     for i in 0..args.repeat.get() {
         let mut expecting = regions.len();
-        h.send_task(regions.clone(), opt, view, palette.clone(), true);
+        h.send_task(regions.clone(), opt, view, w.clone());
 
         timings.clear();
         let before = Instant::now();

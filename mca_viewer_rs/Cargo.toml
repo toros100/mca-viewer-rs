@@ -20,6 +20,7 @@ slint = {version = "~1.18", default-features = false, features = [
 "renderer-femtovg-wgpu",
 "backend-winit-wayland",
 "live-preview",
+"raw-window-handle-06"
 ]}
 
 nucleo-matcher = "0.3"
@@ -29,14 +30,15 @@ bytemuck = {version = "1.25", features = ["derive"]}
 serde = "1"
 clap = {version = "4.6", features = ["derive"]}
 toml = "1.1"
-image = {version = "0.25", default-features = false}
 rustc-hash = "2.1.2"
 crossbeam-channel = "0.5"
 crossbeam-utils = "0.8"
-parking_lot = "0.12.5"
+parking_lot = "0.13"
 static_assertions = "1"
 anyhow = "1"
 thiserror = "2"
+rfd = "0.17"
+jiff = "0.2"
 
 [dev-dependencies]
 rand = "0.10.1"
