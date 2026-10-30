@@ -1,48 +1,43 @@
-use std::{default, marker::PhantomData};
-
 use arrayvec::ArrayVec;
 
-use crate::{
-    DeserializationError, DeserializationResult, Optional, RawString, Tag, deserialize_nbt_str,
-    deserialize_nbt_str_bytes, read_i32_len,
-};
+use crate::{DeserializationError, DeserializationResult, Tag, deserialize_nbt_str, read_i32_len};
 
-pub trait DeserializePayload<'d> {
+pub trait DeserializePayload<'d, C> {
     const TAG: Tag;
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> DeserializationResult<usize>;
+    fn deserialize_payload(&mut self, data: &'d [u8], ctx: &mut C) -> DeserializationResult<usize>;
 }
 
-impl<'d, T: DeserializePayload<'d> + Default> DeserializePayload<'d> for Option<T> {
+impl<'d, C, T: DeserializePayload<'d, C> + Default> DeserializePayload<'d, C> for Option<T> {
     const TAG: Tag = T::TAG;
     #[inline]
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> DeserializationResult<usize> {
-        self.get_or_insert_default().deserialize_payload(data)
+    fn deserialize_payload(&mut self, data: &'d [u8], ctx: &mut C) -> DeserializationResult<usize> {
+        self.get_or_insert_default().deserialize_payload(data, ctx)
     }
 }
 
-impl<'d> DeserializePayload<'d> for &'d str {
+impl<'d, C> DeserializePayload<'d, C> for &'d str {
     const TAG: Tag = Tag::String;
     #[inline]
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> DeserializationResult<usize> {
+    fn deserialize_payload(&mut self, data: &'d [u8], _: &mut C) -> DeserializationResult<usize> {
         let (s, off) = deserialize_nbt_str(data)?;
         *self = s;
         Ok(off)
     }
 }
 
-impl<'d> DeserializePayload<'d> for String {
+impl<'d, C> DeserializePayload<'d, C> for String {
     const TAG: Tag = Tag::String;
     #[inline]
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> DeserializationResult<usize> {
+    fn deserialize_payload(&mut self, data: &'d [u8], _: &mut C) -> DeserializationResult<usize> {
         let (s, off) = deserialize_nbt_str(data)?;
         *self = String::from(s);
         Ok(off)
     }
 }
 
-impl<'d, T: DeserializePayload<'d> + Default> DeserializePayload<'d> for Vec<T> {
+impl<'d, C, T: DeserializePayload<'d, C> + Default> DeserializePayload<'d, C> for Vec<T> {
     const TAG: Tag = Tag::List;
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> DeserializationResult<usize> {
+    fn deserialize_payload(&mut self, data: &'d [u8], ctx: &mut C) -> DeserializationResult<usize> {
         if data.len() < 5 {
             return Err(DeserializationError::EOF);
         };
@@ -66,18 +61,18 @@ impl<'d, T: DeserializePayload<'d> + Default> DeserializePayload<'d> for Vec<T> 
         for _ in 0..len {
             off += self
                 .push_mut(T::default())
-                .deserialize_payload(&data[off..])?;
+                .deserialize_payload(&data[off..], ctx)?;
         }
         Ok(off)
     }
 }
 
-impl<'d, const N: usize, T: DeserializePayload<'d> + Default> DeserializePayload<'d>
+impl<'d, C, const N: usize, T: DeserializePayload<'d, C> + Default> DeserializePayload<'d, C>
     for ArrayVec<T, N>
 {
     const TAG: Tag = Tag::List;
 
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> DeserializationResult<usize> {
+    fn deserialize_payload(&mut self, data: &'d [u8], ctx: &mut C) -> DeserializationResult<usize> {
         if data.len() < 5 {
             return Err(DeserializationError::EOF);
         };
@@ -104,8 +99,8 @@ impl<'d, const N: usize, T: DeserializePayload<'d> + Default> DeserializePayload
 
         for _ in 0..len {
             self.push(T::default());
-            off +=
-                unsafe { self.last_mut().unwrap_unchecked() }.deserialize_payload(&data[off..])?;
+            off += unsafe { self.last_mut().unwrap_unchecked() }
+                .deserialize_payload(&data[off..], ctx)?;
         }
 
         Ok(off)
@@ -115,10 +110,10 @@ impl<'d, const N: usize, T: DeserializePayload<'d> + Default> DeserializePayload
 macro_rules! impl_traits_numeric {
     ($(($t:ty, $tag:expr)),*) => {
         $(
-            impl<'d> DeserializePayload<'d> for $t {
+            impl<'d, C> DeserializePayload<'d, C> for $t {
                 const TAG: Tag = $tag;
                 #[inline]
-                fn deserialize_payload(&mut self, data: &'d[u8]) -> DeserializationResult<usize> {
+                fn deserialize_payload(&mut self, data: &'d[u8], _: &mut C) -> DeserializationResult<usize> {
                     const SIZE: usize = std::mem::size_of::<$t>();
                     if data.len() < SIZE {
                         return Err(DeserializationError::EOF);

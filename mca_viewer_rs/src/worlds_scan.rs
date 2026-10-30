@@ -40,9 +40,13 @@ impl Deref for UnixMillisLong {
     }
 }
 
-impl<'d> nbt::DeserializePayload<'d> for UnixMillisLong {
+impl<'d, C> nbt::DeserializePayload<'d, C> for UnixMillisLong {
     const TAG: nbt::Tag = nbt::Tag::Long;
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> nbt::DeserializationResult<usize> {
+    fn deserialize_payload(
+        &mut self,
+        data: &'d [u8],
+        _: &mut C,
+    ) -> nbt::DeserializationResult<usize> {
         if data.len() < 8 {
             return Err(nbt::DeserializationError::EOF);
         }

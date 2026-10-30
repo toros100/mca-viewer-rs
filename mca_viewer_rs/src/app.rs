@@ -67,7 +67,6 @@ impl NotifyApp {
 }
 
 pub struct AppHandle {
-    #[expect(unused)]
     app: Rc<RefCell<App>>,
     window: slint_gen::MainWindow,
 }
@@ -77,7 +76,6 @@ impl AppHandle {
         Ok(self.window.run()?)
     }
 
-    #[expect(unused)]
     pub fn borrow_mut(&self) -> RefMut<'_, App> {
         self.app.borrow_mut()
     }
@@ -226,8 +224,6 @@ impl App {
             })
         });
         app.borrow_mut().load_palette_model();
-        app.borrow_mut()
-            .set_worlds_directory("/home/tobias/.minecraft/".into());
         app
     }
     fn load_palette_model(&mut self) {
@@ -329,7 +325,6 @@ impl App {
                 && d.view_state.view.keep.contains(s.pos())
             {
                 if let Some(t) = self.tiles.get_mut(&s.pos()) {
-                    if r.task_id == t.task_id {}
                     if t.task_id < r.task_id {
                         t.task_id = r.task_id;
                         t.tile = s;
@@ -678,9 +673,8 @@ impl App {
         // but then the scene would have to contain more than what we know to be visible this frame,
         // and it might be harder to get everything snapped to the pixel grid at variable scale.
 
-        self.overlay_scene.reset();
-
-        if self.show_region_grid {
+        let scene = if self.show_region_grid {
+            self.overlay_scene.reset();
             for pos in self.tiles.keys() {
                 if dim.view_state.view.visible.contains(*pos) {
                     if dim.view_state.curr_scale_pow > -2 {
@@ -697,6 +691,9 @@ impl App {
 
                                 let r = rounded_affine.transform_rect_bbox(chunk_box)
                                     + kurbo::Vec2::splat(0.5);
+
+                                // TODO: render grid to texture just for one region, then reuse the
+                                // same texture for each region
 
                                 self.overlay_scene.stroke(
                                     &kurbo::Stroke::new(1.0),
@@ -734,7 +731,10 @@ impl App {
                     );
                 }
             }
-        }
+            Some(&self.overlay_scene)
+        } else {
+            None
+        };
 
         let tex = r.render(
             self.tiles.iter().map(|(pos, tile)| {
@@ -743,13 +743,16 @@ impl App {
                     &tile.tile.tile,
                 )
             }),
-            &self.overlay_scene,
+            scene,
             w,
             h,
             s,
         );
 
-        Some(slint::Image::try_from(tex).unwrap())
+        Some(
+            slint::Image::try_from(tex)
+                .expect("should be infallible with correct texture format and usages"),
+        )
     }
 
     fn init_renderer(
@@ -850,7 +853,7 @@ impl App {
         }
     }
 
-    fn set_worlds_directory(&mut self, path: PathBuf) {
+    pub fn set_worlds_directory(&mut self, path: PathBuf) {
         let ws = scan_for_worlds(path, 3);
 
         println!("found {} worlds", ws.len());

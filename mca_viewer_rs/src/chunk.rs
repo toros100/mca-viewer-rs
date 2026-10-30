@@ -1,131 +1,35 @@
-use std::ops::{Deref, DerefMut, Index};
+use std::ops::Index;
 
 use nbt::{
-    ConstBytes, DeserializationError, DeserializePayload, arrays::LongArrayBytes, read_i32_len,
+    BumpCtx, ConstBytes, DeserializationError, DeserializePayload, arrays::LongArrayBytes, bumpalo,
+    read_i32_len,
 };
 
 use crate::{block_id::BlockId, palette::PaletteCtx};
 use mca_tools::bitpack::{PackedIndices, PackedIndicesError};
 
 #[derive(Default)]
-pub struct ReusingVec<T> {
-    virtual_len: usize,
-    inner: Vec<T>,
-}
-
-impl<T> Deref for ReusingVec<T> {
-    type Target = [T];
-    fn deref(&self) -> &Self::Target {
-        &self.inner[..self.virtual_len]
-    }
-}
-
-impl<T> DerefMut for ReusingVec<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner[..self.virtual_len]
-    }
-}
-
-impl<T> ReusingVec<T> {
-    /// WARN: does not actually drop elements, just sets the virtual length to 0
-    fn clear(&mut self) {
-        self.virtual_len = 0;
-    }
-
-    fn push(&mut self, t: T) {
-        if self.virtual_len < self.inner.len() {
-            self.inner[self.virtual_len] = t
-        } else {
-            self.inner.push(t)
-        }
-        self.virtual_len += 1
-    }
-
-    fn reserve(&mut self, additional: usize) {
-        if self.inner.capacity() < self.virtual_len + additional {
-            let additional = additional - (self.inner.len() - self.virtual_len);
-            self.inner.reserve(additional);
-        }
-    }
-
-    fn with_capacity(cap: usize) -> Self {
-        Self {
-            inner: Vec::with_capacity(cap),
-            virtual_len: 0,
-        }
-    }
-
-    fn resize_with(&mut self, new_len: usize, f: impl FnMut() -> T) {
-        if new_len > self.virtual_len {
-            self.inner.resize_with(new_len, f);
-        }
-        self.virtual_len = new_len;
-    }
-}
-
-impl<'d, T> DeserializePayload<'d> for ReusingVec<T>
-where
-    T: DeserializePayload<'d> + Default,
-{
-    const TAG: nbt::Tag = nbt::Tag::List;
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> nbt::DeserializationResult<usize> {
-        if data.len() < 5 {
-            return Err(DeserializationError::EOF);
-        };
-
-        let t = nbt::Tag::try_from(data[0])?;
-        let mut off = 1;
-
-        if t != T::TAG {
-            return Err(DeserializationError::UnexpectedTag {
-                expected: T::TAG,
-                found: t,
-            });
-        }
-
-        let len = read_i32_len(&data[off..])?;
-        off += 4;
-
-        self.resize_with(len, || T::default());
-
-        for v in self.iter_mut() {
-            off += v.deserialize_payload(&data[off..])?;
-        }
-
-        Ok(off)
-    }
-}
-
 pub struct ChunkSections<'a> {
-    sections: ReusingVec<Section<'a>>,
+    sections: &'a mut [Section<'a>],
     air_info: BlockInfo,
     pub y_limit: u16,
 }
 
-impl<'d> DeserializePayload<'d> for ChunkSections<'d> {
+impl<'d, C> DeserializePayload<'d, C> for ChunkSections<'d>
+where
+    C: nbt::BumpCtx<'d>,
+{
     const TAG: nbt::Tag = nbt::Tag::List;
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> nbt::DeserializationResult<usize> {
-        self.sections.deserialize_payload(data)
-    }
-}
-
-impl Default for ChunkSections<'_> {
-    fn default() -> Self {
-        Self {
-            sections: ReusingVec::with_capacity(24),
-            y_limit: 0,
-            air_info: BlockInfo::default(),
-        }
+    fn deserialize_payload(
+        &mut self,
+        data: &'d [u8],
+        ctx: &mut C,
+    ) -> nbt::DeserializationResult<usize> {
+        self.sections.deserialize_payload(data, ctx)
     }
 }
 
 impl<'a> ChunkSections<'a> {
-    pub fn sanitize(&mut self) {
-        for s in self.sections.inner.iter_mut() {
-            s.block_states.sanitize();
-        }
-    }
-
     pub fn validate_and_init<P: PaletteCtx>(&mut self, p: &P) -> Result<(), DataError> {
         let (min_section_idx, max_section_idx) = self
             .sections
@@ -149,7 +53,6 @@ impl<'a> ChunkSections<'a> {
                 }
             }
 
-            s.block_states.cached_palette.clear();
             s.block_states.cached_palette_ok = false;
         }
 
@@ -183,6 +86,7 @@ impl<'a> ChunkSections<'a> {
         z: u16,
         mut limit: u16,
         p: &P,
+        bump: &'a bumpalo::Bump,
     ) -> Option<(u16, BlockInfo)> {
         debug_assert!(x < 16);
         debug_assert!(z < 16);
@@ -192,7 +96,9 @@ impl<'a> ChunkSections<'a> {
 
         loop {
             let s = &mut self.sections.get_mut(section_idx)?;
-            let c = s.block_states.non_airy_at_or_below(x, local_y, z, limit, p);
+            let c = s
+                .block_states
+                .non_airy_at_or_below(x, local_y, z, limit, p, bump);
             if c.is_some() {
                 return c.map(|(yy, b)| (yy + (section_idx as u16) * 16, b));
             } else {
@@ -213,6 +119,7 @@ impl<'a> ChunkSections<'a> {
         z: u16,
         mut limit: u16,
         p: &P,
+        bump: &'a bumpalo::Bump,
     ) -> Option<(u16, BlockInfo)> {
         debug_assert!(x < 16);
         debug_assert!(z < 16);
@@ -225,7 +132,7 @@ impl<'a> ChunkSections<'a> {
             let s = self.sections.get_mut(section_idx)?;
             let c = s
                 .block_states
-                .non_watery_at_or_below(x, local_y, z, limit, p);
+                .non_watery_at_or_below(x, local_y, z, limit, p, bump);
             if c.is_some() {
                 return c.map(|(yy, b)| (yy + (section_idx as u16) * 16, b));
             } else {
@@ -241,7 +148,14 @@ impl<'a> ChunkSections<'a> {
     }
 
     #[inline]
-    pub fn block_at<P: PaletteCtx>(&mut self, x: u16, y: u16, z: u16, p: &P) -> BlockInfo {
+    pub fn block_at<P: PaletteCtx>(
+        &mut self,
+        x: u16,
+        y: u16,
+        z: u16,
+        p: &P,
+        bump: &'a bumpalo::Bump,
+    ) -> BlockInfo {
         debug_assert!(x < 16);
         debug_assert!(z < 16);
 
@@ -250,7 +164,7 @@ impl<'a> ChunkSections<'a> {
                 let block_idx = (y % 16) * 256 + 16 * z + x;
                 // NOTE: observe that block_idx <= 4095 by the above asserts
                 s.block_states
-                    .get_block(block_idx, p)
+                    .get_block(block_idx, p, bump)
                     .unwrap_or(self.air_info)
             }
             None => self.air_info,
@@ -283,21 +197,6 @@ pub enum DataError {
     PackedIndices(#[from] PackedIndicesError),
 }
 
-impl<'a> Chunk<'a> {
-    /// consumes a Chunk<'a> (typically with borrowed data), clears any references with lifetime 'a
-    /// and returns Chunk<'static> using unsafe
-    pub fn reclaim(mut self) -> Chunk<'static> {
-        self.sections.sanitize();
-        // # Safety
-        // sanitize gets rid of any 'a-lifetimed references in self (currently only in Vec and
-        // Option, which are cleared resp. set to None).
-        //
-        // i believe this is actually sound, what could possibly go wrong?
-        //
-        unsafe { std::mem::transmute::<Chunk<'a>, Chunk<'static>>(self) }
-    }
-}
-
 /// chunk type for slice mode, which does not need heightmaps
 /// (and the exit_early appears to skip slightly more here, probably not relevant)
 #[derive(Default, DeserializePayload)]
@@ -310,14 +209,6 @@ pub struct SliceChunk<'a> {
 
     #[nbt(rename = "yPos")]
     pub y_pos: i32,
-}
-
-impl<'a> SliceChunk<'a> {
-    // cf. Chunk::reclaim
-    pub fn reclaim(mut self) -> SliceChunk<'static> {
-        self.sections.sanitize();
-        unsafe { std::mem::transmute::<SliceChunk<'a>, SliceChunk<'static>>(self) }
-    }
 }
 
 #[inline]
@@ -364,9 +255,9 @@ impl Default for Heightmap {
     }
 }
 
-impl DeserializePayload<'_> for Heightmap {
+impl<C> DeserializePayload<'_, C> for Heightmap {
     const TAG: nbt::Tag = nbt::Tag::LongArray;
-    fn deserialize_payload(&mut self, data: &[u8]) -> nbt::DeserializationResult<usize> {
+    fn deserialize_payload(&mut self, data: &[u8], _: &mut C) -> nbt::DeserializationResult<usize> {
         let l = read_i32_len(data)?;
         if l != 37 {
             return Err(DeserializationError::Custom(
@@ -423,9 +314,13 @@ impl UnpackedHeightmap {
     }
 }
 
-impl DeserializePayload<'_> for UnpackedHeightmap {
+impl<C> DeserializePayload<'_, C> for UnpackedHeightmap {
     const TAG: nbt::Tag = nbt::Tag::LongArray;
-    fn deserialize_payload(&mut self, data: &'_ [u8]) -> nbt::DeserializationResult<usize> {
+    fn deserialize_payload(
+        &mut self,
+        data: &'_ [u8],
+        _: &mut C,
+    ) -> nbt::DeserializationResult<usize> {
         let l = read_i32_len(data)?;
         if l != 37 {
             return Err(DeserializationError::Custom(
@@ -469,33 +364,26 @@ pub struct Section<'a> {
 }
 
 impl<'a> BlockStates<'a> {
-    pub fn cache_palette<P: PaletteCtx>(&mut self, p: &P) {
-        self.cached_palette.clear();
-        self.cached_palette.reserve(self.palette.len());
-
+    pub fn cache_palette<P: PaletteCtx>(&mut self, p: &P, bump: &'a bumpalo::Bump) {
         self.all_watery = true;
         self.all_airy = true;
 
-        for bs in self.palette.iter() {
-            let id = p.get_or_intern_block_id(bs);
-            let is_watery = is_watery(bs);
-            let is_airy = is_airy(bs);
-            let color = p.get_color(id);
+        let sl: &mut [BlockInfo] = bump.alloc_slice_fill_default(self.palette.len());
 
-            if !is_airy {
+        for (i, bs) in sl.iter_mut().zip(self.palette.iter()) {
+            i.id = p.get_or_intern_block_id(bs);
+            i.is_watery = is_watery(bs);
+            i.is_airy = is_airy(bs);
+            i.color = p.get_color(i.id);
+
+            if !i.is_airy {
                 self.all_airy = false;
             }
-            if !is_watery {
+            if !i.is_watery {
                 self.all_watery = false;
             }
-
-            self.cached_palette.push(BlockInfo {
-                id,
-                color,
-                is_airy,
-                is_watery,
-            })
         }
+        self.cached_palette = sl;
         self.cached_palette_ok = true;
         debug_assert_eq!(self.cached_palette.len(), self.palette.len());
     }
@@ -507,13 +395,14 @@ impl<'a> BlockStates<'a> {
         z: u16,
         limit: u16,
         p: &P,
+        bump: &'a bumpalo::Bump,
     ) -> Option<(u16, BlockInfo)> {
         debug_assert!(x < 16);
         debug_assert!(y < 16);
         debug_assert!(z < 16);
 
         if !self.cached_palette_ok {
-            self.cache_palette(p);
+            self.cache_palette(p, bump);
         }
 
         if self.all_airy {
@@ -522,7 +411,7 @@ impl<'a> BlockStates<'a> {
 
         for yb in (0..=y).rev().take(limit as usize) {
             let block_idx = yb * 256 + 16 * z + x;
-            if let Some(b) = self.get_block(block_idx, p)
+            if let Some(b) = self.get_block(block_idx, p, bump)
                 && !b.is_airy
             {
                 return Some((yb, b));
@@ -538,13 +427,14 @@ impl<'a> BlockStates<'a> {
         z: u16,
         limit: u16,
         p: &P,
+        bump: &'a bumpalo::Bump,
     ) -> Option<(u16, BlockInfo)> {
         debug_assert!(x < 16);
         debug_assert!(y < 16);
         debug_assert!(z < 16);
 
         if !self.cached_palette_ok {
-            self.cache_palette(p);
+            self.cache_palette(p, bump);
         }
 
         if self.all_watery {
@@ -553,7 +443,7 @@ impl<'a> BlockStates<'a> {
 
         for yb in (0..=y).rev().take(limit as usize) {
             let block_idx = yb * 256 + 16 * z + x;
-            if let Some(b) = self.get_block(block_idx, p)
+            if let Some(b) = self.get_block(block_idx, p, bump)
                 && !b.is_watery
             {
                 return Some((yb, b));
@@ -565,11 +455,16 @@ impl<'a> BlockStates<'a> {
 
     /// must have idx < 4096
     #[inline]
-    pub fn get_block<P: PaletteCtx>(&mut self, idx: u16, p: &P) -> Option<BlockInfo> {
+    pub fn get_block<P: PaletteCtx>(
+        &mut self,
+        idx: u16,
+        p: &P,
+        bump: &'a bumpalo::Bump,
+    ) -> Option<BlockInfo> {
         debug_assert!(idx < 4096);
 
         if !self.cached_palette_ok {
-            self.cache_palette(p);
+            self.cache_palette(p, bump);
         }
 
         // if self.indices is SectionIndices::Packed(p), then p was made for self.palette.len()
@@ -609,7 +504,7 @@ pub struct BlockStates<'a> {
     all_watery: bool,
 
     #[nbt(skip)]
-    pub cached_palette: ReusingVec<BlockInfo>,
+    pub cached_palette: &'a [BlockInfo],
 
     #[nbt(skip)]
     cached_palette_ok: bool,
@@ -619,9 +514,6 @@ pub struct BlockStates<'a> {
 
     #[nbt(skip)]
     indices: SectionIndices<'a>,
-
-    #[nbt(skip)]
-    bit_width: usize,
 }
 
 /// used for the palette of blocks per section
@@ -629,7 +521,7 @@ pub struct BlockStates<'a> {
 /// TODO: look into for which game/data versions this structure works
 #[derive(Debug, Default)]
 pub struct Palette<'a> {
-    inner: Vec<&'a [u8]>,
+    inner: &'a [&'a [u8]],
 }
 
 impl Palette<'_> {
@@ -641,18 +533,8 @@ impl Palette<'_> {
         self.inner.is_empty()
     }
 
-    pub fn clear(&mut self) {
-        self.inner.clear();
-    }
-
     fn iter(&self) -> impl Iterator<Item = &[u8]> {
         self.inner.iter().copied()
-    }
-
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            inner: Vec::with_capacity(capacity),
-        }
     }
 }
 
@@ -664,9 +546,16 @@ impl<'a> Index<usize> for Palette<'a> {
     }
 }
 
-impl<'d> nbt::DeserializePayload<'d> for Palette<'d> {
+impl<'d, C> nbt::DeserializePayload<'d, C> for Palette<'d>
+where
+    C: BumpCtx<'d>,
+{
     const TAG: nbt::Tag = nbt::Tag::List;
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> nbt::DeserializationResult<usize> {
+    fn deserialize_payload(
+        &mut self,
+        data: &'d [u8],
+        ctx: &mut C,
+    ) -> nbt::DeserializationResult<usize> {
         if data.len() < 5 {
             return Err(DeserializationError::EOF);
         };
@@ -697,59 +586,58 @@ impl<'d> nbt::DeserializePayload<'d> for Palette<'d> {
         // will have to deal with further changes to the format when i handle biomes, F
         match t {
             nbt::Tag::String => {
-                self.inner.clear();
-                self.inner.reserve(l);
-
-                for _ in 0..l {
-                    let (bs, n) = nbt::deserialize_nbt_str_bytes(&data[off..])?;
-                    off += n;
-                    self.inner.push(bs);
-                }
+                self.inner = ctx.bump().alloc_slice_try_fill_with(
+                    l,
+                    |_| -> Result<&[u8], DeserializationError> {
+                        let (bs, n) = nbt::deserialize_nbt_str_bytes(&data[off..])?;
+                        off += n;
+                        Ok(bs)
+                    },
+                )?;
             }
             nbt::Tag::Compound => {
-                self.inner.clear();
-                self.inner.reserve(l);
-
                 // this is painful, i wish my rust implementation had the same API as my zig implementation
 
-                'list_payloads: for _ in 0..l {
-                    let mut found_block_name = false;
-                    loop {
-                        if off >= data.len() {
-                            return Err(DeserializationError::EOF);
-                        }
-
-                        let t = nbt::Tag::try_from(data[off])?;
-                        off += 1;
-
-                        if t == nbt::Tag::End {
-                            if !found_block_name {
-                                return Err(DeserializationError::Custom(
-                                    "failed to find block name in palette".into(),
-                                ));
-                            } else {
-                                continue 'list_payloads;
+                self.inner = ctx.bump().alloc_slice_try_fill_with(
+                    l,
+                    |_| -> Result<&[u8], DeserializationError> {
+                        let mut block_name = None;
+                        loop {
+                            if off >= data.len() {
+                                return Err(DeserializationError::EOF);
                             }
-                        }
 
-                        let (name, n) = nbt::deserialize_nbt_str_bytes(&data[off..])?;
-                        off += n;
+                            let t = nbt::Tag::try_from(data[off])?;
+                            off += 1;
 
-                        if t == nbt::Tag::String && matches!(name, b"" | b"id" | b"Name") {
-                            if found_block_name {
-                                return Err(DeserializationError::Custom(
-                                    "duplicate block name in palette".into(),
-                                ));
+                            if t == nbt::Tag::End {
+                                if let Some(block_name) = block_name {
+                                    return Ok(block_name);
+                                } else {
+                                    return Err(DeserializationError::Custom(
+                                        "failed to find block name in palette".into(),
+                                    ));
+                                }
                             }
-                            let (block_name, n) = nbt::deserialize_nbt_str_bytes(&data[off..])?;
+
+                            let (name, n) = nbt::deserialize_nbt_str_bytes(&data[off..])?;
                             off += n;
-                            self.inner.push(block_name);
-                            found_block_name = true;
-                        } else {
-                            off += nbt::skip_payload(&data[off..], t)?;
+
+                            if t == nbt::Tag::String && matches!(name, b"" | b"id" | b"Name") {
+                                if block_name.is_some() {
+                                    return Err(DeserializationError::Custom(
+                                        "duplicate block name in palette".into(),
+                                    ));
+                                }
+                                let (bn, n) = nbt::deserialize_nbt_str_bytes(&data[off..])?;
+                                off += n;
+                                block_name = Some(bn);
+                            } else {
+                                off += nbt::skip_payload(&data[off..], t)?;
+                            }
                         }
-                    }
-                }
+                    },
+                )?;
             }
             _ => {
                 return Err(nbt::DeserializationError::Custom(
@@ -761,22 +649,12 @@ impl<'d> nbt::DeserializePayload<'d> for Palette<'d> {
     }
 }
 
-impl BlockStates<'_> {
-    fn sanitize(&mut self) {
-        self.palette.clear();
-        self.indices = SectionIndices::Zero;
-        self.data = None;
-        self.bit_width = 0;
-    }
-}
-
 impl Default for BlockStates<'_> {
     fn default() -> Self {
         Self {
-            palette: Palette::with_capacity(10),
-            cached_palette: ReusingVec::with_capacity(10),
+            palette: Palette::default(),
+            cached_palette: &[],
             data: None,
-            bit_width: 0,
             cached_palette_ok: false,
             indices: SectionIndices::Zero,
             all_airy: true,

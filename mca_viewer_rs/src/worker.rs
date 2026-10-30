@@ -6,6 +6,8 @@ use crossbeam_channel::{Receiver, Sender, select_biased};
 use mca_tools::loader::McaLoader;
 use std::collections::HashSet;
 
+use nbt::bumpalo;
+
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Weak};
@@ -168,6 +170,7 @@ struct Worker<N, P, R, O> {
     task_rx: Receiver<RegionTask<P>>,
     results_tx: Sender<RegionResult<O>>,
     ctx: R,
+    bump: bumpalo::Bump,
 }
 
 impl<N, P, R, O> Worker<N, P, R, O>
@@ -184,6 +187,7 @@ where
         ctx: R,
     ) -> Self {
         Self {
+            bump: bumpalo::Bump::new(),
             darken: vec![0u8; 512 * 512].try_into().unwrap(),
             ms: HeightShadeValues::default(),
             task_rx,
@@ -264,6 +268,7 @@ where
                 opt.depth_darken,
                 opt.block_map,
                 &ctx,
+                &mut self.bump,
             ),
             RenderMode::Slice => draw_region::draw_slice(
                 &mut self.img,
@@ -276,6 +281,7 @@ where
                 opt.depth_darken,
                 opt.block_map,
                 &ctx,
+                &mut self.bump,
             ),
         };
 
@@ -390,33 +396,24 @@ where
         }
     }
 
-    fn idle(&mut self) {
+    fn idle(&mut self) -> Result<(), crossbeam_channel::RecvError> {
         select_biased!(
                 recv(self.render_task_rx) -> res => {
-                    match res {
-                        Ok(s) =>
-                            self.handle_task(s),
-                        Err(e) => {
-                            eprintln!("{e:?}")
-                        }
-                    }
+                    self.handle_task(res?);
                 }
                 recv(self.view_update_rx) -> res => {
-                    match res {
-                        Ok(s) => self.handle_view_update(s),
-                        Err(e) => {
-                            eprintln!("{e:?}")
-                        }
-                    }
+                    self.handle_view_update(res?);
                 }
-        )
+        );
+        Ok(())
     }
 
     pub fn run(&mut self) {
         loop {
-            if self.current_task.is_none() {
-                self.idle();
-            }
+            // i do not really like that this kind of hides control flow in the condition
+            if self.current_task.is_none() && self.idle().is_err() {
+                return;
+            };
 
             select_biased! {
                 recv(self.render_task_rx) -> res => {
@@ -456,9 +453,9 @@ where
                 });
 
                 self.already_rendered.insert(pos);
-            } else {
-                self.idle();
-            }
+            } else if self.idle().is_err() {
+                return;
+            };
         }
     }
 
@@ -562,6 +559,7 @@ mod tests {
             worker::ChunkAccessor,
         };
         use mca_tools::loader::McaError;
+        use nbt::bumpalo;
 
         const CHUNK0: &[u8] = include_bytes!("../test_data/decompressed_chunks/chunk_0.dat");
         const CHUNK1: &[u8] = include_bytes!("../test_data/decompressed_chunks/chunk_1.dat");
@@ -586,10 +584,12 @@ mod tests {
             }
         }
 
-        let mut img = image::RgbaImage::new(512, 512);
+        let mut img = vec![0u8; 4 * 512 * 512].try_into().unwrap();
+        let mut water_img = vec![0u8; 4 * 512 * 512].try_into().unwrap();
         let mut block_map = BlockMap::default();
         let mut height_shade = HeightShadeValues::default();
         let mut darken_data = vec![0u8; 512 * 512].try_into().unwrap();
+        let mut bump = bumpalo::Bump::new();
 
         draw_slice(
             &mut img,
@@ -602,6 +602,7 @@ mod tests {
             true,
             false,
             &DummyPalette,
+            &mut bump,
         )
         .unwrap();
     }

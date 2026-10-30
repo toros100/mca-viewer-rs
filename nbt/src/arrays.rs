@@ -27,11 +27,11 @@ impl<'a> ByteArrayBytes<'a> {
     }
 }
 
-impl<'d> DeserializePayload<'d> for ByteArrayBytes<'d> {
+impl<'d, C> DeserializePayload<'d, C> for ByteArrayBytes<'d> {
     const TAG: Tag = Tag::ByteArray;
 
     #[inline]
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> DeserializationResult<usize> {
+    fn deserialize_payload(&mut self, data: &'d [u8], _: &mut C) -> DeserializationResult<usize> {
         deserialize_array_payload::<1>(&mut self.0, data)
     }
 }
@@ -53,11 +53,11 @@ impl<'a> IntArrayBytes<'a> {
     }
 }
 
-impl<'d> DeserializePayload<'d> for IntArrayBytes<'d> {
+impl<'d, C> DeserializePayload<'d, C> for IntArrayBytes<'d> {
     const TAG: Tag = Tag::IntArray;
 
     #[inline]
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> DeserializationResult<usize> {
+    fn deserialize_payload(&mut self, data: &'d [u8], _: &mut C) -> DeserializationResult<usize> {
         deserialize_array_payload::<4>(&mut self.0, data)
     }
 }
@@ -79,11 +79,11 @@ impl<'a> LongArrayBytes<'a> {
     }
 }
 
-impl<'d> DeserializePayload<'d> for LongArrayBytes<'d> {
+impl<'d, C> DeserializePayload<'d, C> for LongArrayBytes<'d> {
     const TAG: Tag = Tag::LongArray;
 
     #[inline]
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> DeserializationResult<usize> {
+    fn deserialize_payload(&mut self, data: &'d [u8], _: &mut C) -> DeserializationResult<usize> {
         deserialize_array_payload::<8>(&mut self.0, data)
     }
 }

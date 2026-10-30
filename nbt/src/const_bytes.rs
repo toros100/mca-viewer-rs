@@ -1,6 +1,6 @@
 use crate::{
-    DeserializationError, DeserializationResult, DeserializePayload, SerializationError,
-    SerializationResult, SerializePayload, Tag,
+    DeserializationError, DeserializationResult, DeserializePayload, SerializationResult,
+    SerializePayload, Tag,
 };
 
 /// any type implementing this trait will implement DeserializePayload via a blanket implementation,
@@ -26,27 +26,25 @@ pub trait ConstBytes {
     const ERR_MSG: Option<&'static str> = None;
 }
 
-impl<'d, C: ConstBytes> DeserializePayload<'d> for C {
+impl<'d, CB: ConstBytes, C> DeserializePayload<'d, C> for CB {
     // TODO: const asserts for reasonability of the payload bytes?
     // for some values of Tag, the len is fully determined (e.g. Tag::Int always 4 bytes)
     // for Tag::String the len is always at least 2 (length prefix), and if it is exactly 2, then it
     // must be b"\x00\x00" etc
     // a lot could be done here i guess, but it can't be fully validated
 
-    const TAG: Tag = C::TAG;
+    const TAG: Tag = CB::TAG;
 
     #[inline]
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> DeserializationResult<usize> {
-        const _: () = {};
-
-        if data.len() < C::BYTES.len() {
+    fn deserialize_payload(&mut self, data: &'d [u8], _: &mut C) -> DeserializationResult<usize> {
+        if data.len() < CB::BYTES.len() {
             return Err(DeserializationError::EOF);
         };
-        if C::BYTES == &data[0..C::BYTES.len()] {
-            Ok(C::BYTES.len())
+        if CB::BYTES == &data[0..CB::BYTES.len()] {
+            Ok(CB::BYTES.len())
         } else {
             Err(DeserializationError::Custom(
-                C::ERR_MSG.unwrap_or("ConstBytes mismatch").into(),
+                CB::ERR_MSG.unwrap_or("ConstBytes mismatch").into(),
             ))
         }
     }

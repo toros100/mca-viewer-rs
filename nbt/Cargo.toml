@@ -7,6 +7,13 @@ edition = "2024"
 nbt_derive = {path = "../nbt_derive/"}
 thiserror = "2.0.18"
 arrayvec = "0.7.8"
+bumpalo = {version = "3.20",  optional = true}
+
+[features]
+bumpalo = ["dep:bumpalo"]
 
 [dev-dependencies]
 rand = "0.10.1"
+
+[lints]
+workspace = true

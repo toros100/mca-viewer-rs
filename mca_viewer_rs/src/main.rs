@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use clap::Parser;
 use mca_viewer_rs::palette::{BlockPalette, TomlPalette};
 use std::{num::NonZeroUsize, sync::Arc};
@@ -9,9 +11,9 @@ const PALETTE_TOML_STR: &str = include_str!("../palette.toml");
 
 #[derive(clap::Parser)]
 struct Args {
-    // should probably still have the path arg for dev
-    // #[arg(long, short)]
-    // path: PathBuf,
+    #[arg(long, short)]
+    path: Option<std::path::PathBuf>,
+
     #[arg(long, short)]
     num_workers: Option<NonZeroUsize>,
 }
@@ -35,6 +37,10 @@ fn main() -> anyhow::Result<()> {
     let ctx = BlockPalette::new(TomlPalette::try_from(PALETTE_TOML_STR)?, [255, 0, 255, 255]);
 
     let app = app::new(num_workers, Arc::new(ctx))?;
+
+    if let Some(path) = args.path {
+        app.borrow_mut().set_worlds_directory(path);
+    }
 
     app.run()
 }

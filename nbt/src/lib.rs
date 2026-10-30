@@ -1,7 +1,6 @@
-#![allow(unused)]
 extern crate self as nbt;
 
-use std::{default, fmt::Debug, io::Write, marker::PhantomData, ops::Deref};
+use std::fmt::Debug;
 pub mod arrays;
 mod error;
 mod helper;
@@ -14,6 +13,11 @@ mod const_bytes;
 pub use const_bytes::*;
 mod raw_str;
 pub use raw_str::*;
+
+#[cfg(feature = "bumpalo")]
+mod bump;
+#[cfg(feature = "bumpalo")]
+pub use bump::*;
 
 pub use error::*;
 
@@ -77,10 +81,11 @@ impl TryFrom<u8> for Tag {
     }
 }
 
-pub trait DeserializeExt<'d>: DeserializePayload<'d> + Sized {
+pub trait DeserializeExt<'d, C>: DeserializePayload<'d, C> {
     fn try_deserialize_into(
         &mut self,
         data: &'d [u8],
+        ctx: &mut C,
     ) -> Result<(&'d str, usize), DeserializationError> {
         if data.len() < 4 {
             // the shortest possible fully formed tag is a byte tag with:
@@ -102,16 +107,17 @@ pub trait DeserializeExt<'d>: DeserializePayload<'d> + Sized {
         let (name, k) = deserialize_nbt_str(&data[off..])?;
         off += k;
 
-        off += self.deserialize_payload(&data[off..])?;
+        off += self.deserialize_payload(&data[off..], ctx)?;
 
         Ok((name, off))
     }
 }
 
-impl<'d, T: DeserializePayload<'d>> DeserializeExt<'d> for T {}
+impl<'d, C, T: DeserializePayload<'d, C>> DeserializeExt<'d, C> for T {}
 
-pub fn from_bytes<'d, T: DeserializePayload<'d> + Default>(
+pub fn from_bytes<'d, T: DeserializePayload<'d, C> + Default, C>(
     data: &'d [u8],
+    ctx: &mut C,
 ) -> DeserializationResult<(&'d str, T, usize)> {
     if data.len() < 4 {
         // the shortest possible fully formed tag is a byte tag with:
@@ -135,7 +141,7 @@ pub fn from_bytes<'d, T: DeserializePayload<'d> + Default>(
 
     let mut payload = T::default();
 
-    off += payload.deserialize_payload(&data[off..])?;
+    off += payload.deserialize_payload(&data[off..], ctx)?;
 
     Ok((name, payload, off))
 }
@@ -167,12 +173,12 @@ mod tests {
 
     fn roundtrip_helper<T>(root_name: &str, t: T)
     where
-        T: SerializePayload + for<'d> DeserializePayload<'d> + Default + PartialEq + Debug,
+        T: SerializePayload + for<'d> DeserializePayload<'d, ()> + Default + PartialEq + Debug,
     {
         let serialized = nbt::to_bytes(root_name, &t).expect("should serialize without error");
 
-        let (root_name_de, t_de, bytes_consumed) =
-            nbt::from_bytes::<T>(&serialized).expect("should deserialize without error");
+        let (root_name_de, t_de, bytes_consumed) = nbt::from_bytes::<T, ()>(&serialized, &mut ())
+            .expect("should deserialize without error");
 
         assert_eq!(root_name, root_name_de);
         assert_eq!(serialized.len(), bytes_consumed);
@@ -249,7 +255,7 @@ mod tests {
             other_field: String,
         }
 
-        let r = nbt::from_bytes::<Data2>(bs.as_slice());
+        let r = nbt::from_bytes::<Data2, ()>(bs.as_slice(), &mut ());
         std::assert_matches!(r, Err(nbt::DeserializationError::FieldNotFound(_)));
 
         // yes this is a bit confusing, not a huge fan

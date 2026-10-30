@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use crate::{
     DeserializationError, DeserializationResult, SerializationError, SerializationResult, Tag,
 };
@@ -102,6 +100,7 @@ pub fn read_i32_len(data: &[u8]) -> DeserializationResult<usize> {
     Ok(l as usize)
 }
 
+#[inline]
 fn skip_list_payload(data: &[u8]) -> DeserializationResult<usize> {
     if data.is_empty() {
         return Err(DeserializationError::EOF);
@@ -127,6 +126,7 @@ fn skip_list_payload(data: &[u8]) -> DeserializationResult<usize> {
     }
 }
 
+#[inline]
 fn skip_compound_payload(data: &[u8]) -> DeserializationResult<usize> {
     let mut off = 0;
     loop {
@@ -151,6 +151,7 @@ fn skip_compound_payload(data: &[u8]) -> DeserializationResult<usize> {
     Ok(off)
 }
 
+#[inline]
 pub fn skip_payload(data: &[u8], tag: Tag) -> DeserializationResult<usize> {
     match tag {
         Tag::Byte => skip_k(data, 1),
@@ -165,7 +166,7 @@ pub fn skip_payload(data: &[u8], tag: Tag) -> DeserializationResult<usize> {
         Tag::LongArray => skip_fixed_size_seq(data, 8),
         Tag::String => skip_nbt_str(data),
         Tag::Compound => skip_compound_payload(data),
-        t => panic!("skip_payload with tag == Tag::End"),
+        Tag::End => panic!("skip_payload with tag == Tag::End"),
     }
 }
 

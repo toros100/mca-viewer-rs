@@ -19,11 +19,12 @@ struct Instance {
 }
 
 #[derive(Clone)]
-#[allow(unused)]
 pub struct GpuTile {
     texture: Option<wgpu::Texture>, // None when wrapping an external view
     bind_group: wgpu::BindGroup,
+    #[expect(unused)]
     width: u32,
+    #[expect(unused)]
     height: u32,
 }
 

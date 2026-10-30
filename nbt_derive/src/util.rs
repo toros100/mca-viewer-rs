@@ -1,43 +1,6 @@
-use quote::ToTokens;
-use quote::quote;
 use syn::DeriveInput;
 use syn::LifetimeParam;
 use syn::spanned::Spanned;
-
-pub struct LifetimeSubstitution {
-    from: syn::Lifetime,
-    to: syn::Lifetime,
-}
-
-impl LifetimeSubstitution {
-    pub fn new(from: syn::Lifetime, to: syn::Lifetime) -> Self {
-        Self { from, to }
-    }
-}
-
-impl syn::visit_mut::VisitMut for LifetimeSubstitution {
-    fn visit_lifetime_mut(&mut self, lt: &mut syn::Lifetime) {
-        if *lt == self.from {
-            *lt = self.to.clone();
-        }
-    }
-}
-
-pub fn insert_lifetime(
-    impl_generics: syn::ImplGenerics,
-    lt: syn::Lifetime,
-) -> proc_macro2::TokenStream {
-    let impl_tok = impl_generics.to_token_stream();
-    let mut iter = impl_tok.into_iter();
-
-    match iter.next() {
-        None => quote! {<#lt>},
-        Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '<' => {
-            quote! { <#lt, #(#iter)*}
-        }
-        _ => panic!("unexpected token stream"),
-    }
-}
 
 pub struct ProcessedField {
     pub field: syn::Field,

@@ -1,12 +1,14 @@
 use crate::block_id::BlockId;
 use crate::worker::ChunkAccessor;
-use std::ops::DerefMut;
+use std::ops::{Deref, DerefMut};
 
 use crate::block_map::BlockMap;
 use crate::chunk::{BlockInfo, Chunk, SliceChunk};
 use crate::color_ops::{blend_over, darken_water, mul_rgb, soft_depth_darken, water_opacity};
 use crate::palette::PaletteCtx;
 use nbt::DeserializeExt;
+
+use nbt::bumpalo;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DrawError {
@@ -109,6 +111,13 @@ impl HeightShadeValues {
     }
 }
 
+impl Deref for HeightShadeValues {
+    type Target = [u8; 512 * 512];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl Default for HeightShadeValues {
     fn default() -> Self {
         Self(vec![Self::SCALE_100; 512 * 512].try_into().unwrap())
@@ -126,6 +135,7 @@ pub fn draw_region<P: PaletteCtx>(
     depth_darken: bool,
     with_block_map: bool,
     ctx: &P,
+    bump: &mut bumpalo::Bump,
 ) -> Result<(), DrawError> {
     main_layer.fill(0);
     water_layer.fill(0);
@@ -150,9 +160,6 @@ pub fn draw_region<P: PaletteCtx>(
     let mut height_cache = HeightCache::default();
     let mut any_chunk_ok = false;
 
-    #[cfg(not(feature = "cautious_unsafe"))]
-    let mut chunk = Chunk::default();
-
     // for overworld regions, this will be the actual sea level
     // otherwise, it is a relatively arbitrary value i picked to make the
     // darkening of blocks below "sea level" work
@@ -165,10 +172,7 @@ pub fn draw_region<P: PaletteCtx>(
         for chunk_x in (0..32).rev() {
             let chunk_idx = 32 * chunk_z + chunk_x;
 
-            #[cfg(not(feature = "cautious_unsafe"))]
-            {
-                chunk = chunk.reclaim();
-            }
+            bump.reset();
 
             let cd = match loader.get_chunk_data(chunk_idx) {
                 Err(_) => {
@@ -178,21 +182,9 @@ pub fn draw_region<P: PaletteCtx>(
                 Ok(cd) => cd,
             };
 
-            #[cfg(not(feature = "cautious_unsafe"))]
-            {
-                if chunk.try_deserialize_into(cd).is_err() {
-                    height_cache.invalidate(chunk_x);
-                    continue;
-                }
-            }
-
-            #[cfg(feature = "cautious_unsafe")]
-            let mut chunk = match nbt::from_bytes::<Chunk>(cd) {
-                Err(_) => {
-                    height_cache.invalidate(chunk_x);
-                    continue;
-                }
-                Ok((_, c, _)) => c,
+            let Ok((chunk, _, _)) = nbt::try_from_bytes_in::<Chunk>(cd, bump) else {
+                height_cache.invalidate(chunk_x);
+                continue;
             };
 
             if chunk.sections.validate_and_init(ctx).is_err() {
@@ -224,7 +216,8 @@ pub fn draw_region<P: PaletteCtx>(
                 height_shade,
                 darken_data,
                 ChunkWithPalette {
-                    chunk: &mut chunk,
+                    bump,
+                    chunk,
                     palette: ctx,
                 },
                 block_map,
@@ -264,6 +257,7 @@ pub fn draw_slice<P: PaletteCtx>(
     depth_darken: bool,
     with_block_map: bool,
     ctx: &P,
+    bump: &mut bumpalo::Bump,
 ) -> Result<(), DrawError> {
     main_layer.fill(0);
     water_layer.fill(0);
@@ -283,9 +277,6 @@ pub fn draw_slice<P: PaletteCtx>(
     height_shade.clear();
     darken_data.fill(255);
 
-    #[cfg(not(feature = "cautious_unsafe"))]
-    let mut chunk = crate::chunk::SliceChunk::default();
-
     let mut height_cache = HeightCache::default();
     let mut any_chunk_ok = false;
 
@@ -293,10 +284,7 @@ pub fn draw_slice<P: PaletteCtx>(
         for chunk_x in (0..32).rev() {
             let chunk_idx = 32 * chunk_z + chunk_x;
 
-            #[cfg(not(feature = "cautious_unsafe"))]
-            {
-                chunk = chunk.reclaim();
-            }
+            bump.reset();
 
             let cd = match loader.get_chunk_data(chunk_idx) {
                 Err(_) => {
@@ -306,22 +294,12 @@ pub fn draw_slice<P: PaletteCtx>(
                 Ok(cd) => cd,
             };
 
-            #[cfg(not(feature = "cautious_unsafe"))]
-            {
-                if chunk.try_deserialize_into(cd).is_err() {
-                    height_cache.invalidate(chunk_x);
-                    continue;
-                }
-            }
+            let chunk = bump.alloc_with(SliceChunk::default);
 
-            #[cfg(feature = "cautious_unsafe")]
-            let mut chunk = match nbt::from_bytes::<SliceChunk>(cd) {
-                Err(_) => {
-                    height_cache.invalidate(chunk_x);
-                    continue;
-                }
-                Ok((_, c, _)) => c,
-            };
+            if chunk.try_deserialize_into(cd, &mut &*bump).is_err() {
+                height_cache.invalidate(chunk_x);
+                continue;
+            }
 
             if chunk.sections.validate_and_init(ctx).is_err() {
                 height_cache.invalidate(chunk_x);
@@ -349,11 +327,12 @@ pub fn draw_slice<P: PaletteCtx>(
                         block_z,
                         limit,
                         ctx,
+                        bump,
                     );
                     #[cfg(debug_assertions)]
                     {
                         if let Some((h, b)) = res {
-                            let c = chunk.sections.block_at(block_x, h, block_z, ctx);
+                            let c = chunk.sections.block_at(block_x, h, block_z, ctx, bump);
                             assert_eq!(b.id, c.id);
                             assert!(!c.is_airy);
                         }
@@ -367,12 +346,12 @@ pub fn draw_slice<P: PaletteCtx>(
                 let h_non_watery = {
                     let res = chunk
                         .sections
-                        .non_watery_at_or_below(block_x, h_non_airy, block_z, limit, ctx);
+                        .non_watery_at_or_below(block_x, h_non_airy, block_z, limit, ctx, bump);
 
                     #[cfg(debug_assertions)]
                     {
                         if let Some((h, b)) = res {
-                            let c = chunk.sections.block_at(block_x, h, block_z, ctx);
+                            let c = chunk.sections.block_at(block_x, h, block_z, ctx, bump);
                             assert_eq!(b.id, c.id);
                             assert!(!c.is_watery);
                         }
@@ -392,10 +371,11 @@ pub fn draw_slice<P: PaletteCtx>(
                 height_shade,
                 darken_data,
                 SliceChunkWithPalette {
-                    chunk: &mut chunk,
+                    chunk,
                     palette: ctx,
                     world_surface: &synth_world_surface,
                     ocean_floor: &synth_ocean_floor,
+                    bump,
                 },
                 block_map,
                 &mut height_cache,
@@ -427,6 +407,7 @@ trait ChunkData {
 struct ChunkWithPalette<'d, 'a, P> {
     chunk: &'a mut Chunk<'d>,
     palette: &'a P,
+    bump: &'d bumpalo::Bump,
 }
 
 impl<'d, 'a, P> ChunkData for ChunkWithPalette<'d, 'a, P>
@@ -434,7 +415,9 @@ where
     P: PaletteCtx,
 {
     fn block_at(&mut self, x: u16, y: u16, z: u16) -> BlockInfo {
-        self.chunk.sections.block_at(x, y, z, self.palette)
+        self.chunk
+            .sections
+            .block_at(x, y, z, self.palette, self.bump)
     }
 
     fn ocean_floor_at(&self, x: u16, z: u16) -> u16 {
@@ -451,6 +434,7 @@ struct SliceChunkWithPalette<'d, 'a, P> {
     palette: &'a P,
     world_surface: &'a [u16; 256],
     ocean_floor: &'a [u16; 256],
+    bump: &'d bumpalo::Bump,
 }
 
 impl<'d, 'a, P> ChunkData for SliceChunkWithPalette<'d, 'a, P>
@@ -458,7 +442,9 @@ where
     P: PaletteCtx,
 {
     fn block_at(&mut self, x: u16, y: u16, z: u16) -> BlockInfo {
-        self.chunk.sections.block_at(x, y, z, self.palette)
+        self.chunk
+            .sections
+            .block_at(x, y, z, self.palette, self.bump)
     }
 
     fn world_surface_at(&self, x: u16, z: u16) -> u16 {
@@ -493,7 +479,7 @@ fn draw_chunk<CD: ChunkData>(
         let px_y = 16 * chunk_z as u32 + block_z as u32;
         let px_idx = (px_x + 512 * px_y) as usize;
 
-        let mut modulus = 0;
+        let mut m = 0;
 
         let h = chunk_data.world_surface_at(block_x, block_z);
         let block = chunk_data.block_at(block_x, h.saturating_sub(1), block_z);
@@ -533,9 +519,9 @@ fn draw_chunk<CD: ChunkData>(
                 HeightCache::INVALID_HEIGHT
             };
 
-            modulus += height_diff(h, n_neighbour_height);
-            modulus += height_diff(h, e_neighbour_height);
-            modulus += height_diff(h, ne_neighbour_height);
+            m += height_diff(h, n_neighbour_height);
+            m += height_diff(h, e_neighbour_height);
+            m += height_diff(h, ne_neighbour_height);
 
             // NOTE: to get the height shading to be perfect (without any artifacts around
             // region borders), we would need to take into account the height of some blocks
@@ -546,8 +532,7 @@ fn draw_chunk<CD: ChunkData>(
             // independently anymore.)
 
             main_layer[px_idx] = block.color;
-            // main_layer.put_pixel(px_x, px_y, image::Rgba::from(block.color));
-            height_shade.set(px_idx, modulus);
+            height_shade.set(px_idx, m);
         } else {
             let h_ocean_floor = chunk_data.ocean_floor_at(block_x, block_z);
             let block_below =
@@ -588,7 +573,7 @@ fn draw_chunk<CD: ChunkData>(
 pub fn compose_image(
     main_layer: &mut [[u8; 4]; 512 * 512],
     water_layer: &[[u8; 4]; 512 * 512],
-    height_shade_data: &HeightShadeValues,
+    height_shade_data: &[u8; 512 * 512],
     darken_data: &[u8; 512 * 512],
 ) {
     // idea:
@@ -605,12 +590,6 @@ pub fn compose_image(
 
     // darken_data: values applied to a color multiplicatively to darken the color (i.e. water based
     // on depth, or based on depth w.r.t slice height or sea level)
-
-    let height_shade_data: &[u8; 512 * 512] = &height_shade_data.0;
-
-    // no remainder, length is clearly multiple of 4
-    // let (pixels, _) = main_layer.as_chunks_mut::<4>();
-    // let (water_pixels, _) = water_layer.as_chunks::<4>();
 
     for (((p, m), wp), d) in main_layer
         .iter_mut()

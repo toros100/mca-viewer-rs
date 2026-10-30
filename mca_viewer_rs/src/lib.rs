@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod block_id;
 pub mod block_map;
 pub mod color_ops;

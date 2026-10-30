@@ -1,10 +1,7 @@
-use crate::{
-    LifetimeSubstitution, get_borrow_lifetime, insert_lifetime, parse_struct_attrs, process_fields,
-};
-use quote::{ToTokens, quote, quote_spanned};
-use syn::DeriveInput;
+use crate::{get_borrow_lifetime, parse_struct_attrs, process_fields};
+use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
-use syn::visit_mut::VisitMut;
+use syn::{DeriveInput, parse_quote};
 
 pub fn derive_deserialize_payload_inner(
     input: DeriveInput,
@@ -28,6 +25,9 @@ pub fn derive_deserialize_payload_inner(
             ));
         }
     };
+
+    // TODO: should ensure __C is a fresh identifier
+    let ctx_ty = syn::Ident::new("__C", proc_macro2::Span::call_site());
 
     let fields = process_fields(fs)?;
     let attrs = parse_struct_attrs(&input.attrs)?;
@@ -66,14 +66,14 @@ pub fn derive_deserialize_payload_inner(
                     return Err(::nbt::DeserializationError::FieldDuplicate(#field_str))
                 };
 
-                if <#ty as ::nbt::DeserializePayload>::TAG != t {
+                if <#ty as ::nbt::DeserializePayload::<#ctx_ty>>::TAG != t {
                     return Err(::nbt::DeserializationError::UnexpectedTag{
-                        expected: <#ty as ::nbt::DeserializePayload>::TAG,
+                        expected: <#ty as ::nbt::DeserializePayload::<#ctx_ty>>::TAG,
                         found: t,
                     })
                 };
 
-                off += ::nbt::DeserializePayload::deserialize_payload(&mut self.#field_ident, &data[off..])?;
+                off += ::nbt::DeserializePayload::<#ctx_ty>::deserialize_payload(&mut self.#field_ident, &data[off..], ctx)?;
 
                 found_fields[#i] = true;
                 if EXIT_EARLY {
@@ -92,46 +92,31 @@ pub fn derive_deserialize_payload_inner(
 
     let num_fields = fields.len();
 
-    let generics_cl_1 = input.generics.clone();
-    let mut generics_cl_2 = input.generics.clone();
-    let borrow_lt = syn::Lifetime::new("'__b", proc_macro2::Span::call_site());
+    let mut g = input.generics.clone();
 
-    let (trait_lt, impl_generics, ty_generics, where_clause, _borrow_ty_generics) = {
-        match get_borrow_lifetime(&input)? {
-            Some(lp) => {
-                let trait_lt = lp.lifetime.clone();
+    let (trait_lt, impl_generics, ty_generics, where_clause) = {
+        let trait_lt = if let Some(lt) = get_borrow_lifetime(&input)? {
+            lt.lifetime.clone()
+        } else {
+            // TODO: should ensure '__d is a fresh lifetime
+            let trait_lt = syn::Lifetime::new("'__d", proc_macro2::Span::call_site());
+            g.params.push(parse_quote!(#trait_lt));
+            trait_lt
+        };
 
-                let mut subst_borrow_lt =
-                    LifetimeSubstitution::new(lp.lifetime.clone(), borrow_lt.clone());
-                subst_borrow_lt.visit_generics_mut(&mut generics_cl_2);
+        g.params.push(parse_quote!(#ctx_ty));
 
-                let (impl_generics, ty_generics, where_clause) = generics_cl_1.split_for_impl();
-
-                let (_, borrow_ty_generics, _) = generics_cl_2.split_for_impl();
-
-                (
-                    trait_lt,
-                    impl_generics.into_token_stream(),
-                    ty_generics,
-                    where_clause,
-                    borrow_ty_generics,
-                )
-            }
-            None => {
-                let trait_lt = syn::Lifetime::new("'__d", proc_macro2::Span::call_site());
-                let (impl_generics, ty_generics, where_clause) = generics_cl_1.split_for_impl();
-
-                let borrow_ty_generics = ty_generics.clone();
-
-                (
-                    trait_lt.clone(),
-                    insert_lifetime(impl_generics, trait_lt),
-                    ty_generics,
-                    where_clause,
-                    borrow_ty_generics,
-                )
-            }
+        let wc = g.make_where_clause();
+        for f in fields.iter() {
+            let ty = &f.field.ty;
+            wc.predicates
+                .push(parse_quote!(#ty: ::nbt::DeserializePayload<#trait_lt, #ctx_ty>));
         }
+
+        let (impl_generics, _, where_clause) = g.split_for_impl();
+        let (_, ty_generics, _) = input.generics.split_for_impl();
+
+        (trait_lt, impl_generics, ty_generics, where_clause)
     };
 
     let assert_impl_optional_fn = quote! {fn _assert_impl_optional<T: ::nbt::Optional>(){}};
@@ -150,10 +135,10 @@ pub fn derive_deserialize_payload_inner(
     }
 
     Ok(quote! {
-        impl #impl_generics ::nbt::DeserializePayload<#trait_lt> for #name #ty_generics #where_clause {
+        impl #impl_generics ::nbt::DeserializePayload<#trait_lt, #ctx_ty> for #name #ty_generics #where_clause {
             const TAG: ::nbt::Tag = ::nbt::Tag::Compound;
 
-            fn deserialize_payload(&mut self, data: &#trait_lt [u8]) -> ::nbt::DeserializationResult<usize> {
+            fn deserialize_payload(&mut self, data: &#trait_lt [u8], ctx: &mut #ctx_ty) -> ::nbt::DeserializationResult<usize> {
 
                 #assert_impl_optional_fn
                 #(#impl_optional_asserts)*

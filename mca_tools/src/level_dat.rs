@@ -35,7 +35,7 @@ pub enum DatError {
 impl DatReader {
     pub fn read<'d, L>(&'d mut self, mut r: impl std::io::Read) -> Result<L, DatError>
     where
-        L: DeserializePayload<'d> + Default,
+        L: DeserializePayload<'d, ()> + Default,
     {
         self.read_scratch.clear();
         r.read_to_end(&mut self.read_scratch)?;
@@ -56,7 +56,7 @@ impl DatReader {
 
         // outer tags name always empty/meaningless
         // could return, but would just discard it at the callsite
-        let (_, l, _) = nbt::from_bytes::<L>(&self.decompress_scratch[..n])?;
+        let (_, l, _) = nbt::from_bytes::<L, ()>(&self.decompress_scratch[..n], &mut ())?;
         Ok(l)
     }
 }

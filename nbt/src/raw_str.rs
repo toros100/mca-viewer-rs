@@ -1,6 +1,6 @@
 use crate::{
     DeserializationResult, DeserializePayload, SerializationResult, SerializePayload, Tag,
-    deserialize_nbt_str_bytes, serialize_nbt_str, serialize_nbt_str_bytes,
+    deserialize_nbt_str_bytes, serialize_nbt_str_bytes,
 };
 
 /// raw nbt string bytes, not checked for utf8
@@ -24,10 +24,10 @@ impl<'a> std::ops::Deref for RawString<'a> {
     }
 }
 
-impl<'d> DeserializePayload<'d> for RawString<'d> {
+impl<'d, C> DeserializePayload<'d, C> for RawString<'d> {
     const TAG: Tag = Tag::String;
     #[inline]
-    fn deserialize_payload(&mut self, data: &'d [u8]) -> DeserializationResult<usize> {
+    fn deserialize_payload(&mut self, data: &'d [u8], _: &mut C) -> DeserializationResult<usize> {
         let (b, off) = deserialize_nbt_str_bytes(data)?;
         self.0 = b;
         Ok(off)

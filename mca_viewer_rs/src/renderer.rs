@@ -1,14 +1,14 @@
 use slint::wgpu_30::wgpu;
 use vello::kurbo::Rect;
 mod wgpu_render;
-pub use wgpu_render::{GpuTile, WgpuRenderCtx};
+pub use wgpu_render::{GpuTile, WgpuRenderCtx, WgpuRenderer};
 
 pub const TEX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-const VELLO_USAGE: wgpu::TextureUsages =
+pub const VELLO_USAGES: wgpu::TextureUsages =
     wgpu::TextureUsages::STORAGE_BINDING.union(wgpu::TextureUsages::TEXTURE_BINDING);
 
-const SLINT_USAGE: wgpu::TextureUsages =
+pub const SLINT_USAGES: wgpu::TextureUsages =
     wgpu::TextureUsages::TEXTURE_BINDING.union(wgpu::TextureUsages::RENDER_ATTACHMENT);
 
 pub struct Renderer {
@@ -18,12 +18,15 @@ pub struct Renderer {
 
     vello_renderer: vello::Renderer,
 
+    vello_usages: wgpu::TextureUsages,
+    dst_usages: wgpu::TextureUsages,
+
     vello_tex: wgpu::Texture,
     vello_view: wgpu::TextureView,
     vello_tile: GpuTile,
 
-    slint_tex: wgpu::Texture,
-    slint_view: wgpu::TextureView,
+    dst_tex: wgpu::Texture,
+    dst_view: wgpu::TextureView,
 
     wgpu_renderer: wgpu_render::WgpuRenderer,
 }
@@ -33,12 +36,18 @@ impl Renderer {
         self.wgpu_renderer.ctx()
     }
 
-    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
-        let vello_tex = make_texture(&device, "vello_target", VELLO_USAGE, 1, 1);
+    // only required for headless binary (needs COPY_SRC to read back rgba data)
+    pub fn new_with_usages(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        vello_usages: wgpu::TextureUsages,
+        dst_usages: wgpu::TextureUsages,
+    ) -> Self {
+        let vello_tex = make_texture(&device, "vello", vello_usages, 1, 1);
         let vello_view = vello_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let slint_tex = make_texture(&device, "slint_target", SLINT_USAGE, 1, 1);
-        let slint_view = slint_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let dst_tex = make_texture(&device, "dst", dst_usages, 1, 1);
+        let dst_view = dst_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let wgpu_renderer = wgpu_render::WgpuRenderer::new(&device, &queue, TEX_FORMAT);
 
@@ -54,6 +63,8 @@ impl Renderer {
         .unwrap();
 
         Self {
+            vello_usages,
+            dst_usages,
             vello_tile,
             vello_renderer,
             texture_dimensions: (1, 1),
@@ -61,10 +72,14 @@ impl Renderer {
             queue,
             vello_tex,
             vello_view,
-            slint_tex,
-            slint_view,
+            dst_tex,
+            dst_view,
             wgpu_renderer,
         }
+    }
+
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        Self::new_with_usages(device, queue, VELLO_USAGES, SLINT_USAGES)
     }
 
     fn resize_textures(&mut self, w: f32, h: f32, s: f32) {
@@ -75,23 +90,23 @@ impl Renderer {
 
         self.texture_dimensions = (tw, th);
 
-        self.vello_tex = make_texture(&self.device, "vello_target", VELLO_USAGE, tw, th);
+        self.vello_tex = make_texture(&self.device, "vello_target", self.vello_usages, tw, th);
         self.vello_view = self
             .vello_tex
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         self.vello_tile = self.wgpu_renderer.tile_from_view(&self.vello_view, tw, th);
 
-        self.slint_tex = make_texture(&self.device, "slint_target", SLINT_USAGE, tw, th);
-        self.slint_view = self
-            .slint_tex
+        self.dst_tex = make_texture(&self.device, "slint_target", self.dst_usages, tw, th);
+        self.dst_view = self
+            .dst_tex
             .create_view(&wgpu::TextureViewDescriptor::default());
     }
 
     pub fn render<'a>(
         &'a mut self,
         tiles: impl Iterator<Item = (Rect, &'a GpuTile)>,
-        scene: &vello::Scene,
+        scene: Option<&vello::Scene>,
         w: f32,
         h: f32,
         s: f32,
@@ -100,37 +115,42 @@ impl Renderer {
 
         let (tw, th) = self.texture_dimensions;
 
-        self.vello_renderer
-            .render_to_texture(
-                &self.device,
-                &self.queue,
-                scene,
-                &self.vello_view,
-                &vello::RenderParams {
-                    base_color: vello::peniko::color::palette::css::TRANSPARENT,
-                    width: tw,
-                    height: th,
-                    antialiasing_method: vello::AaConfig::Area,
-                },
-            )
-            .unwrap();
-
         let mut encoder = self.device.create_command_encoder(&Default::default());
 
-        let full_screen = Rect::from_origin_size((0., 0.), (tw as f64, th as f64));
+        if let Some(scene) = scene {
+            self.vello_renderer
+                .render_to_texture(
+                    &self.device,
+                    &self.queue,
+                    scene,
+                    &self.vello_view,
+                    &vello::RenderParams {
+                        base_color: vello::peniko::color::palette::css::TRANSPARENT,
+                        width: tw,
+                        height: th,
+                        antialiasing_method: vello::AaConfig::Area,
+                    },
+                )
+                .unwrap();
 
-        let overlay = (full_screen, &self.vello_tile);
+            let full_screen = Rect::from_origin_size((0., 0.), (tw as f64, th as f64));
 
-        self.wgpu_renderer.render(
-            &mut encoder,
-            &self.slint_view,
-            tw,
-            th,
-            tiles.chain(std::iter::once(overlay)),
-        );
+            let overlay = (full_screen, &self.vello_tile);
+
+            self.wgpu_renderer.render(
+                &mut encoder,
+                &self.dst_view,
+                tw,
+                th,
+                tiles.chain(std::iter::once(overlay)),
+            );
+        } else {
+            self.wgpu_renderer
+                .render(&mut encoder, &self.dst_view, tw, th, tiles)
+        }
 
         self.queue.submit(Some(encoder.finish()));
-        self.slint_tex.clone()
+        self.dst_tex.clone()
     }
 }
 
